@@ -339,6 +339,70 @@ def mse_calibrate(
     """
     # Step 1: First get initial amax using max calibration
     max_calibrate(model, forward_loop, distributed_sync)
+    name_to_module = dict(model.named_modules())
+
+    def _initialize_missing_weight_amax():
+        """Initialize weight amax for quantizers skipped by routing during max calibration."""
+        initialized = 0
+        seen = set()
+
+        for parent_module in name_to_module.values():
+            if parent_module in seen:
+                continue
+
+            for weight_name in weight_attr_names(parent_module):
+                weight_quantizer_name = quantizer_attr_names(weight_name).weight_quantizer
+                weight_quantizer = getattr(parent_module, weight_quantizer_name, None)
+                if not isinstance(weight_quantizer, TensorQuantizer):
+                    continue
+                if (
+                    not weight_quantizer.is_enabled
+                    or getattr(weight_quantizer, "_dynamic", False)
+                    or getattr(weight_quantizer, "_use_constant_amax", False)
+                    or getattr(weight_quantizer, "_calibrator", None) is None
+                    or getattr(weight_quantizer, "_amax", None) is not None
+                ):
+                    continue
+
+                was_quant_enabled = getattr(weight_quantizer, "_if_quant", True)
+                was_calib_enabled = getattr(weight_quantizer, "_if_calib", False)
+                weight_quantizer.disable_quant()
+                weight_quantizer.enable_calib()
+
+                try:
+                    with enable_weight_access_and_writeback(parent_module, model, name_to_module):
+                        try:
+                            weight = getattr(parent_module, weight_name)
+                        except AttributeError:
+                            continue
+                        weight_quantizer(weight)
+
+                    cal = getattr(weight_quantizer, "_calibrator", None)
+                    if cal is not None and cal.compute_amax() is not None:
+                        weight_quantizer.load_calib_amax()
+                        initialized += 1
+                    if cal is not None and hasattr(cal, "reset"):
+                        cal.reset()
+                finally:
+                    if was_quant_enabled:
+                        weight_quantizer.enable_quant()
+                    else:
+                        weight_quantizer.disable_quant()
+                    if was_calib_enabled:
+                        weight_quantizer.enable_calib()
+                    else:
+                        weight_quantizer.disable_calib()
+
+            seen.add(parent_module)
+
+        return initialized
+
+    initialized_weight_amax = _initialize_missing_weight_amax()
+    if initialized_weight_amax:
+        print_rank_0(
+            f"MSE calibration initialized weight amax for {initialized_weight_amax} "
+            "weight quantizers without calibration hits."
+        )
 
     # Step 2: Replace calibrators with MseCalibrator for enabled quantizers
     # and identify weight quantizers
@@ -402,7 +466,6 @@ def mse_calibrate(
                 )
 
     # Identify weight quantizers by checking if they have corresponding weight parameters
-    name_to_module = dict(model.named_modules())
     for parent_module in name_to_module.values():
         if parent_module in seen_modules:
             continue

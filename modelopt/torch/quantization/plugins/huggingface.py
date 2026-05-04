@@ -1039,8 +1039,60 @@ class _QuantCompressedLinear(QuantModule):
 
         return linear(self.input_quantizer(input), self.weight_quantizer(weight_data), self.bias)
 
+    @contextmanager
+    def enable_weight_access_and_writeback(self):
+        """Temporarily expose compressed INT4 weights as a dense ``weight`` parameter.
+
+        Some calibration algorithms, such as MSE weight-scale search, need direct
+        ``module.weight`` access instead of only seeing weights through ``forward``.
+        Keeping this scoped avoids materializing all MoE experts at once.
+        """
+        from compressed_tensors.quantization import QuantizationStatus
+
+        if self.quantization_status != QuantizationStatus.COMPRESSED or not hasattr(
+            self, "weight_packed"
+        ):
+            yield
+            return
+        if not getattr(self.weight_quantizer, "is_enabled", False):
+            yield
+            return
+
+        has_existing_weight = (
+            "weight" in self._parameters
+            or "weight" in self._buffers
+            or "weight" in self.__dict__
+        )
+        if has_existing_weight:
+            yield
+            return
+
+        if self.weight_packed.dtype == torch.int32:
+            compressed_data, quant_args = self._build_compressed_data()
+            weight = self.compressor.decompress_weight(
+                compressed_data=compressed_data,
+                quantization_args=quant_args,
+            )
+        else:
+            # Some modules reuse CompressedLinear but store floating weights in
+            # weight_packed. Treat those as already materialized for calibration.
+            weight = self.weight_packed
+
+        param = nn.Parameter(weight.detach(), requires_grad=False)
+        self._parameters["weight"] = param
+        self.__dict__["weight"] = param
+        try:
+            yield
+        finally:
+            self._parameters.pop("weight", None)
+            self._buffers.pop("weight", None)
+            self.__dict__.pop("weight", None)
+
     def unpack_weight(self):
         from compressed_tensors.quantization import QuantizationStatus
+
+        if not getattr(self.weight_quantizer, "is_enabled", False):
+            return
 
         if self.quantization_status == QuantizationStatus.COMPRESSED:
             compressed_data, quant_args = self._build_compressed_data()

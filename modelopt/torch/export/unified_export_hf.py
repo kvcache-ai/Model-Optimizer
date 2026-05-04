@@ -506,7 +506,7 @@ def _export_quantized_weight(
 
         if (
             input_quantizer is not None
-            and "disabled" not in repr(input_quantizer)
+            and _is_enabled_quantizer(input_quantizer)
             and input_quantizer.amax is not None
         ):
             sub_module.register_buffer(
@@ -604,8 +604,6 @@ def _export_quantized_weight(
     # Register the corrected weight_scale as a buffer
     if weight_scale is not None:
         sub_module.register_buffer(quantizer_attrs.weight_scale, weight_scale)
-
-    torch.cuda.empty_cache()
 
 
 def _process_quantized_modules(

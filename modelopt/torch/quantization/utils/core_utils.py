@@ -216,6 +216,15 @@ def weight_attr_names(module: nn.Module) -> "Generator[str, None, None]":
     weight_quantizer = getattr(module, "weight_quantizer", None)
     if weight is not None and isinstance(weight_quantizer, (TensorQuantizer, SequentialQuantizer)):
         yield "weight"
+    elif (
+        getattr(module, "weight_packed", None) is not None
+        and isinstance(weight_quantizer, (TensorQuantizer, SequentialQuantizer))
+        and getattr(weight_quantizer, "is_enabled", False)
+    ):
+        # compressed_tensors modules such as Kimi MoE experts do not keep a
+        # dense weight parameter, but can expose one through
+        # enable_weight_access_and_writeback().
+        yield "weight"
 
     # other weight and quantizer case
     for name, _ in module.named_parameters(recurse=False):
@@ -505,19 +514,31 @@ def enable_weight_access_and_writeback(module, root_model, name_to_module: dict 
             models, particularly Sparse MoE architectures where each expert is typically
             implemented as its own module.
     """
+    contexts = []
+    uses_module_context = False
+
     if _get_enclosing_fsdp_module(module, root_model, name_to_module) is not None:
-        context = fsdp2_weight_access_and_writeback_context(module, root_model)
+        contexts.append(fsdp2_weight_access_and_writeback_context(module, root_model))
     elif is_quantized_parallel_linear(module) and hasattr(module, "_hf_tp_plan"):
         # HF transformers TP sharded linear layer
-        context = module.enable_weight_access_and_writeback()
-    elif hasattr(module, "_hf_hook"):
+        contexts.append(module.enable_weight_access_and_writeback())
+        uses_module_context = True
+
+    if hasattr(module, "_hf_hook"):
         from ..plugins.accelerate import weight_access_and_writeback_context
 
-        context = weight_access_and_writeback_context(module)
-    else:
-        context = nullcontext()
+        contexts.append(weight_access_and_writeback_context(module))
 
-    with context:
+    module_context = getattr(module, "enable_weight_access_and_writeback", None)
+    if callable(module_context) and not uses_module_context:
+        contexts.append(module_context())
+
+    if not contexts:
+        contexts.append(nullcontext())
+
+    with ExitStack() as stack:
+        for context in contexts:
+            stack.enter_context(context)
         yield
 
 
