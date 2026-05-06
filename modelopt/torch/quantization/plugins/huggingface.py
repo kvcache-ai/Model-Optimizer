@@ -989,6 +989,86 @@ class _QuantCompressedLinear(QuantModule):
         self.input_quantizer = TensorQuantizer()
         self.weight_quantizer = TensorQuantizer()
 
+    def get_uncompressed_weight_shape(self) -> tuple[int, int]:
+        """Return the dense weight shape without materializing compressed weights."""
+        out_features = getattr(self, "out_features", None)
+        in_features = getattr(self, "in_features", None)
+        if out_features is not None and in_features is not None:
+            return int(out_features), int(in_features)
+
+        weight_shape = getattr(self, "weight_shape", None)
+        if isinstance(weight_shape, torch.Tensor):
+            weight_shape = weight_shape.detach().cpu().tolist()
+        if isinstance(weight_shape, (list, tuple)) and len(weight_shape) >= 2:
+            return int(weight_shape[-2]), int(weight_shape[-1])
+
+        raise RuntimeError("Cannot infer uncompressed CompressedLinear weight shape.")
+
+    def _normalize_weight_smooth_scale(self, scale: torch.Tensor) -> torch.Tensor:
+        scale = scale.detach().squeeze().to(torch.float32)
+        if scale.numel() != self.in_features:
+            raise ValueError(
+                f"weight smooth scale has {scale.numel()} values, expected {self.in_features}"
+            )
+        return scale
+
+    def _get_pending_weight_smooth_scale(self) -> torch.Tensor | None:
+        return getattr(self, "_modelopt_pending_weight_smooth_scale", None)
+
+    def _scale_weight_tensor(self, weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        scale = self._normalize_weight_smooth_scale(scale).to(weight.device)
+        view_shape = [1] * weight.dim()
+        view_shape[-1] = scale.numel()
+        return (weight.to(torch.float32) * scale.view(view_shape)).to(weight.dtype)
+
+    def _apply_pending_weight_smooth_scale(self, weight: torch.Tensor) -> torch.Tensor:
+        scale = self._get_pending_weight_smooth_scale()
+        if scale is None:
+            return weight
+        return self._scale_weight_tensor(weight, scale)
+
+    def ensure_awq_pre_quant_scale_for_export(self):
+        """Recover input-side AWQ scale from the lazy weight-side scale before export."""
+        if self.input_quantizer.pre_quant_scale is not None:
+            return
+        scale = self._get_pending_weight_smooth_scale()
+        if scale is None:
+            return
+        pre_quant_scale = (1.0 / scale.to(torch.float32)).to(scale.dtype)
+        self.input_quantizer._enable_pre_quant_scale = True
+        self.input_quantizer.pre_quant_scale = pre_quant_scale
+
+    def apply_weight_smooth_scale(self, scale: torch.Tensor, *, multiply: bool = False):
+        """Record an AWQ weight-side smoothing scale for lazy compressed weights.
+
+        The scale is intentionally kept as a plain CPU tensor attribute. Export
+        materializes it into the final packed NVFP4 weight, so serving does not
+        need to understand this internal state.
+        """
+        scale = self._normalize_weight_smooth_scale(scale)
+        old_scale = self._get_pending_weight_smooth_scale()
+        if old_scale is None:
+            new_scale = scale
+            scale_for_existing_weight = scale
+        elif multiply:
+            new_scale = old_scale * scale.to(old_scale.device)
+            scale_for_existing_weight = scale
+        else:
+            new_scale = scale
+            scale_for_existing_weight = scale.to(old_scale.device) / old_scale
+
+        self._modelopt_pending_weight_smooth_scale = new_scale.cpu()
+
+        existing_weight = self._parameters.get("weight")
+        if existing_weight is None:
+            existing_weight = self._buffers.get("weight")
+        if existing_weight is None:
+            existing_weight = self.__dict__.get("weight")
+        if existing_weight is not None:
+            existing_weight.data.copy_(
+                self._scale_weight_tensor(existing_weight.data, scale_for_existing_weight)
+            )
+
     def _build_compressed_data(self):
         """Build compressed_data dict and quantization_args from module attributes.
 
@@ -1018,7 +1098,7 @@ class _QuantCompressedLinear(QuantModule):
 
         return compressed_data, quant_args
 
-    def forward(self, input: Tensor) -> Tensor:
+    def _materialize_weight_data(self) -> Tensor:
         from compressed_tensors.quantization import QuantizationStatus
 
         if self.quantization_status == QuantizationStatus.COMPRESSED:
@@ -1037,6 +1117,10 @@ class _QuantCompressedLinear(QuantModule):
         else:
             weight_data = self.weight
 
+        return self._apply_pending_weight_smooth_scale(weight_data)
+
+    def forward(self, input: Tensor) -> Tensor:
+        weight_data = self._materialize_weight_data()
         return linear(self.input_quantizer(input), self.weight_quantizer(weight_data), self.bias)
 
     @contextmanager
@@ -1067,16 +1151,7 @@ class _QuantCompressedLinear(QuantModule):
             yield
             return
 
-        if self.weight_packed.dtype == torch.int32:
-            compressed_data, quant_args = self._build_compressed_data()
-            weight = self.compressor.decompress_weight(
-                compressed_data=compressed_data,
-                quantization_args=quant_args,
-            )
-        else:
-            # Some modules reuse CompressedLinear but store floating weights in
-            # weight_packed. Treat those as already materialized for calibration.
-            weight = self.weight_packed
+        weight = self._materialize_weight_data()
 
         param = nn.Parameter(weight.detach(), requires_grad=False)
         self._parameters["weight"] = param
@@ -1094,18 +1169,20 @@ class _QuantCompressedLinear(QuantModule):
         if not getattr(self.weight_quantizer, "is_enabled", False):
             return
 
+        self.ensure_awq_pre_quant_scale_for_export()
+
         if self.quantization_status == QuantizationStatus.COMPRESSED:
             compressed_data, quant_args = self._build_compressed_data()
 
             # Skip non-pack-quantized weights (e.g., vision modules stored as BF16)
             if isinstance(compressed_data["weight_packed"], torch.Tensor):
-                if compressed_data["weight_packed"].dtype != torch.int32:
+                if (
+                    compressed_data["weight_packed"].dtype != torch.int32
+                    and self._get_pending_weight_smooth_scale() is None
+                ):
                     return
 
-            decompressed = self.compressor.decompress_weight(
-                compressed_data=compressed_data,
-                quantization_args=quant_args,
-            )
+            decompressed = self._materialize_weight_data()
             # Clear any placeholder before registering the real parameter
             self._parameters.pop("weight", None)
             self._buffers.pop("weight", None)
@@ -1126,6 +1203,8 @@ class _QuantCompressedLinear(QuantModule):
                 delattr(self, "weight_shape")
         if self.quantization_status == QuantizationStatus.COMPRESSED:
             self.quantization_status = QuantizationStatus.FROZEN
+        if hasattr(self, "_modelopt_pending_weight_smooth_scale"):
+            delattr(self, "_modelopt_pending_weight_smooth_scale")
 
 
 class _QuantFP8Linear(QuantModule):

@@ -92,6 +92,23 @@ def get_experts_list(
         model_type: `type(root_model).__name__.lower()` (may change after ModelOpt quantize).
     """
     experts_list = []
+    experts = getattr(module, "experts", None)
+
+    if hasattr(experts, "__iter__"):
+        experts_seq = list(experts)
+        if experts_seq:
+            first_expert = experts_seq[0]
+            for linear_names in (
+                ["gate_proj", "down_proj", "up_proj"],
+                ["w1", "w2", "w3"],
+                ["up_proj", "down_proj"],
+                ["linear_fc1", "linear_fc2"],
+            ):
+                if all(hasattr(first_expert, linear_name) for linear_name in linear_names):
+                    return [
+                        [getattr(expert, linear_name) for expert in experts_seq]
+                        for linear_name in linear_names
+                    ]
 
     # Define linear layer names for different model types
     if "mixtralforcausallm" in model_type:
@@ -313,6 +330,8 @@ def is_moe(module: nn.Module) -> bool:
     name = type(module).__name__.lower()
     # Auto-detect common MoE patterns
     if name.endswith("sparsemoeblock") or "moelayer" in name:
+        return True
+    if "deepseek" in name and "moe" in name:
         return True
     # Explicit matches for non-standard naming
     return any(key in name for key in ["arcticmoe", "deepseekmoe", "dbrxffn", "nemotronhmoe"])
@@ -981,6 +1000,20 @@ def get_expert_linear_names(module: nn.Module) -> list[str]:
     if hasattr(module, "experts") and hasattr(module.experts, "gate_up_proj_weight_quantizers"):
         return ["gate_up_proj", "down_proj"]
 
+    experts = getattr(module, "experts", None)
+    if hasattr(experts, "__iter__"):
+        experts_iter = iter(experts)
+        first_expert = next(experts_iter, None)
+        if first_expert is not None:
+            for linear_names in (
+                ["gate_proj", "down_proj", "up_proj"],
+                ["w1", "w2", "w3"],
+                ["up_proj", "down_proj"],
+                ["linear_fc1", "linear_fc2"],
+            ):
+                if all(hasattr(first_expert, linear_name) for linear_name in linear_names):
+                    return linear_names
+
     if module_match_name_list(
         module,
         [
@@ -989,6 +1022,7 @@ def get_expert_linear_names(module: nn.Module) -> list[str]:
             "Qwen3NextSparseMoeBlock",
             "Qwen3_5MoeSparseMoeBlock",
             "DeepseekMoE",
+            "DeepseekV3MoE",
         ],
     ):
         return ["gate_proj", "down_proj", "up_proj"]

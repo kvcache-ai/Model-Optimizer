@@ -16,6 +16,7 @@
 """Code that export quantized Hugging Face models for deployment."""
 
 import collections.abc
+import fnmatch
 import json
 import re
 import tempfile
@@ -116,6 +117,60 @@ def _is_enabled_quantizer(quantizer):
         return any(q.is_enabled for q in quantizer)
 
     return False
+
+
+def _excluded_pattern_matches_module(pattern: str, module_name: str) -> bool:
+    """Return whether an HF quant exclude pattern matches a module name."""
+    return (
+        fnmatch.fnmatch(module_name, pattern)
+        or fnmatch.fnmatch(f"{module_name}.", pattern)
+        or (pattern == "lm_head" and module_name.endswith(".lm_head"))
+    )
+
+
+def _drop_excluded_lm_head_compressed_residue(
+    state_dict: dict[str, Any], quant_config: dict[str, Any]
+) -> dict[str, Any]:
+    """Drop stale compressed buffers for excluded dense lm_head modules.
+
+    Kimi checkpoints keep lm_head as a real BF16 weight while many MoE experts are stored
+    in compressed form. If lm_head is represented by a CompressedLinear wrapper during
+    export, stale compressed buffers can leak into the state dict alongside the real
+    ``lm_head.weight``. Serving should see the excluded lm_head as a dense BF16 module.
+    """
+    exclude_modules = quant_config.get("quantization", {}).get("exclude_modules", [])
+    if not exclude_modules:
+        return state_dict
+
+    residue_suffixes = (
+        ".weight_packed",
+        ".weight_scale",
+        ".weight_shape",
+        ".weight_scale_2",
+        ".input_scale",
+    )
+    keys_to_drop: list[str] = []
+
+    for weight_key in state_dict:
+        if not weight_key.endswith(".weight"):
+            continue
+        module_name = weight_key.removesuffix(".weight")
+        if not module_name.endswith("lm_head"):
+            continue
+        if not any(_excluded_pattern_matches_module(pattern, module_name) for pattern in exclude_modules):
+            continue
+
+        for suffix in residue_suffixes:
+            residue_key = f"{module_name}{suffix}"
+            if residue_key in state_dict:
+                keys_to_drop.append(residue_key)
+
+    if keys_to_drop:
+        state_dict = dict(state_dict)
+        for key in keys_to_drop:
+            state_dict.pop(key, None)
+
+    return state_dict
 
 
 def _save_component_state_dict_safetensors(
@@ -771,6 +826,11 @@ def _export_transformers_checkpoint(
     # TODO: Handle mixed precision
     requantize_resmooth_fused_llm_layers(model)
 
+    for _, sub_module in model.named_modules():
+        ensure_awq_pre_quant_scale = getattr(sub_module, "ensure_awq_pre_quant_scale_for_export", None)
+        if callable(ensure_awq_pre_quant_scale):
+            ensure_awq_pre_quant_scale()
+
     # Remove all hooks from the model
     try:
         from accelerate.hooks import remove_hook_from_module
@@ -780,6 +840,13 @@ def _export_transformers_checkpoint(
         warnings.warn("accelerate is not installed, hooks will not be removed")
 
     quant_config = get_quant_config(model, is_modelopt_qlora=is_modelopt_qlora)
+
+    extra_exclude_modules = getattr(model, "_modelopt_extra_exclude_modules", None)
+    if extra_exclude_modules:
+        exclude_modules = quant_config["quantization"].setdefault("exclude_modules", [])
+        for pattern in extra_exclude_modules:
+            if pattern not in exclude_modules:
+                exclude_modules.append(pattern)
 
     # Add MTP layer prefixes to exclude_modules if they were excluded from quantization
     # This ensures they appear in quantization_config["ignore"] in config.json
@@ -824,6 +891,9 @@ def _export_transformers_checkpoint(
     kv_cache_format = quant_config["quantization"]["kv_cache_quant_algo"]
     quantized_state_dict = postprocess_state_dict(
         quantized_state_dict, kv_cache_max_bound, kv_cache_format, is_modelopt_qlora
+    )
+    quantized_state_dict = _drop_excluded_lm_head_compressed_residue(
+        quantized_state_dict, quant_config
     )
 
     return quantized_state_dict, quant_config

@@ -108,6 +108,7 @@ QUANT_CFG_CHOICES: dict[str, dict[str, Any]] = {
     "w4a8_awq": mtq.W4A8_AWQ_BETA_CFG,
     "nvfp4": mtq.NVFP4_DEFAULT_CFG,
     "nvfp4_awq": mtq.NVFP4_AWQ_LITE_CFG,
+    "nvfp4_awq_experts_only": mtq.NVFP4_AWQ_EXPERTS_ONLY_CFG,
     "nvfp4_mse": mtq.NVFP4_W4A4_WEIGHT_MSE_FP8_SWEEP_CFG,
     "fp8_pb_wo": mtq.FP8_2D_BLOCKWISE_WEIGHT_ONLY_CFG,
     "fp8_pc_pt": mtq.FP8_PER_CHANNEL_PER_TOKEN_CFG,
@@ -115,6 +116,10 @@ QUANT_CFG_CHOICES: dict[str, dict[str, Any]] = {
     "w4a8_mxfp4_fp8": mtq.W4A8_MXFP4_FP8_CFG,
     "nvfp4_mlp_only": mtq.NVFP4_MLP_ONLY_CFG,
     "nvfp4_experts_only": mtq.NVFP4_EXPERTS_ONLY_CFG,
+    "nvfp4_local_hessian_experts_only": mtq.NVFP4_LOCAL_HESSIAN_EXPERTS_ONLY_CFG,
+    "nvfp4_local_hessian_middle_moe_experts_only": (
+        mtq.NVFP4_LOCAL_HESSIAN_MIDDLE_MOE_EXPERTS_ONLY_CFG
+    ),
     "nvfp4_omlp_only": mtq.NVFP4_OMLP_ONLY_CFG,
     "nvfp4_svdquant": mtq.NVFP4_SVDQUANT_DEFAULT_CFG,
     "mxfp8": mtq.MXFP8_DEFAULT_CFG,
@@ -330,12 +335,15 @@ def auto_quantize(
             "int4_awq",
             "nvfp4",
             "nvfp4_awq",
+            "nvfp4_awq_experts_only",
             "nvfp4_mse",
             "w4a8_awq",
             "fp8_pb_wo",
             "w4a8_mxfp4_fp8",
             "nvfp4_mlp_only",
             "nvfp4_experts_only",
+            "nvfp4_local_hessian_experts_only",
+            "nvfp4_local_hessian_middle_moe_experts_only",
             "nvfp4_omlp_only",
             "nvfp4_local_hessian",
             "mxfp8",
@@ -754,6 +762,12 @@ def export_quantized(
             assert args.sparsity_fmt == "dense", (
                 f"Sparsity format {args.sparsity_fmt} not supported by unified export api."
             )
+
+            if any(qformat.endswith("experts_only") for qformat in args.qformat.split(",")):
+                full_model._modelopt_extra_exclude_modules = [
+                    "mm_projector*",
+                    "vision_tower*",
+                ]
 
             if args.inference_tensor_parallel != 1 or args.inference_pipeline_parallel != 1:
                 warnings.warn(

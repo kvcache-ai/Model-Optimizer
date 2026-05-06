@@ -41,6 +41,7 @@ from modelopt.torch.quantization.qtensor import (
 from modelopt.torch.quantization.utils import (
     QuantizerAttrNames,
     quantizer_attr_names,
+    reduce_amax,
     reduce_block_amax,
     weight_attr_names,
 )
@@ -269,6 +270,16 @@ def _set_amax_from_tensor(weight_quantizer: TensorQuantizer, tensor: torch.Tenso
         weight_quantizer.register_buffer("_amax", tensor.clone().detach())
 
 
+def _is_nvfp4_static_block_quantizer(weight_quantizer: TensorQuantizer) -> bool:
+    block_sizes = getattr(weight_quantizer, "block_sizes", None)
+    return (
+        getattr(weight_quantizer, "is_static_block_quant", False)
+        and getattr(weight_quantizer, "num_bits", None) == (2, 1)
+        and isinstance(block_sizes, dict)
+        and block_sizes.get("scale_bits") == (4, 3)
+    )
+
+
 def _ensure_weight_quantizer_calibrated(
     weight_quantizer: TensorQuantizer, weight: torch.Tensor, module_name: str = ""
 ) -> None:
@@ -285,12 +296,23 @@ def _ensure_weight_quantizer_calibrated(
         weight: The weight tensor to use for calibration
         module_name: Optional module name for better warning messages
     """
+    if _is_nvfp4_static_block_quantizer(weight_quantizer) and not isinstance(
+        weight_quantizer, NVFP4StaticQuantizer
+    ):
+        global_amax = None
+        if hasattr(weight_quantizer, "_amax") and weight_quantizer._amax is not None:
+            global_amax = reduce_amax(weight_quantizer._amax, axis=None)
+        NVFP4StaticQuantizer.from_tensor_quantizer(weight_quantizer, global_amax=global_amax)
+
     if isinstance(weight_quantizer, NVFP4StaticQuantizer):
         need_per_block = not hasattr(weight_quantizer, "_amax") or weight_quantizer._amax is None
         need_global = (
             not hasattr(weight_quantizer, "_global_amax") or weight_quantizer.global_amax is None
         )
         if not (need_per_block or need_global):
+            return
+        if need_global and not need_per_block:
+            weight_quantizer.global_amax = reduce_amax(weight_quantizer._amax, axis=None)
             return
         block_size = _get_nvfp4_block_size(weight_quantizer, weight, module_name)
         warn(
@@ -1159,21 +1181,34 @@ def all_items_same(item_list):
 def _update_pre_quant_scale(module, new_pre_quant_scale):
     old_pre_quant_scale = module.input_quantizer._pre_quant_scale
     # do the processing in fp32 for numerical stability
-    dtype = module.weight.dtype
-    module.weight = nn.Parameter(
-        (
-            module.weight.to(torch.float32)
-            * old_pre_quant_scale.to(dtype=torch.float32, device=module.weight.device)
-            / new_pre_quant_scale.to(dtype=torch.float32, device=module.weight.device)
-        ).to(dtype)
+    weight_scale_ratio = old_pre_quant_scale.to(torch.float32) / new_pre_quant_scale.to(
+        torch.float32
     )
+    apply_weight_smooth_scale = getattr(module, "apply_weight_smooth_scale", None)
+    if callable(apply_weight_smooth_scale):
+        apply_weight_smooth_scale(weight_scale_ratio, multiply=True)
+    else:
+        dtype = module.weight.dtype
+        module.weight = nn.Parameter(
+            (
+                module.weight.to(torch.float32)
+                * weight_scale_ratio.to(device=module.weight.device)
+            ).to(dtype)
+        )
     module.input_quantizer.pre_quant_scale = new_pre_quant_scale
 
     # Redo weights collection
     module.weight_quantizer.reset_amax()
-    enable_stats_collection(module.weight_quantizer)
-    module.weight_quantizer(module.weight)
-    finish_stats_collection(module.weight_quantizer)
+    enable_weight_access = getattr(module, "enable_weight_access_and_writeback", None)
+    if callable(enable_weight_access):
+        with enable_weight_access():
+            enable_stats_collection(module.weight_quantizer)
+            module.weight_quantizer(module.weight)
+            finish_stats_collection(module.weight_quantizer)
+    else:
+        enable_stats_collection(module.weight_quantizer)
+        module.weight_quantizer(module.weight)
+        finish_stats_collection(module.weight_quantizer)
 
 
 def _update_svdquant(modules, new_pre_quant_scale):

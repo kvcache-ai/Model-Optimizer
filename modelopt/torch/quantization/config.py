@@ -562,6 +562,11 @@ _nvfp4_cfg_bs32 = {
     "block_sizes": {-1: 32, "type": "dynamic", "scale_bits": (4, 3)},
 }
 
+_nvfp4_static_cfg = {
+    "num_bits": (2, 1),
+    "block_sizes": {-1: 16, "type": "static", "scale_bits": (4, 3)},
+}
+
 
 def _nvfp4_selective_quant_cfg(
     layer_patterns: list[str],
@@ -626,6 +631,61 @@ NVFP4_W4A4_WEIGHT_LOCAL_HESSIAN_CFG = {
     },
 }
 
+NVFP4_LOCAL_HESSIAN_EXPERTS_ONLY_CFG = {
+    "quant_cfg": [
+        *_base_disable_all,
+        *[
+            item
+            for pattern in ["*mlp.experts*", "*block_sparse_moe*"]
+            for item in (
+                {
+                    "quantizer_name": f"{pattern}weight_quantizer",
+                    "cfg": copy.deepcopy(_nvfp4_static_cfg),
+                },
+                {
+                    "quantizer_name": f"{pattern}input_quantizer",
+                    "cfg": copy.deepcopy(_nvfp4_cfg),
+                },
+            )
+        ],
+        *_default_disabled_quantizer_cfg,
+    ],
+    "algorithm": {
+        "method": "local_hessian",
+        "fp8_scale_sweep": True,
+    },
+}
+
+NVFP4_LOCAL_HESSIAN_MIDDLE_MOE_EXPERTS_ONLY_CFG = {
+    "quant_cfg": [
+        *_base_disable_all,
+        *[
+            item
+            for layer_idx in range(4, 57)
+            for pattern in (
+                f"*model.layers.{layer_idx}.mlp.experts*",
+                f"*model.layers.{layer_idx}.mlp.shared_expert*",
+                f"*model.layers.{layer_idx}.block_sparse_moe*",
+            )
+            for item in (
+                {
+                    "quantizer_name": f"{pattern}weight_quantizer",
+                    "cfg": copy.deepcopy(_nvfp4_static_cfg),
+                },
+                {
+                    "quantizer_name": f"{pattern}input_quantizer",
+                    "cfg": copy.deepcopy(_nvfp4_cfg),
+                },
+            )
+        ],
+        *_default_disabled_quantizer_cfg,
+    ],
+    "algorithm": {
+        "method": "local_hessian",
+        "fp8_scale_sweep": True,
+    },
+}
+
 MAMBA_MOE_NVFP4_AGGRESSIVE_CFG = {
     "quant_cfg": [
         *_base_disable_all,
@@ -650,6 +710,10 @@ MAMBA_MOE_NVFP4_CONSERVATIVE_CFG = {
 }
 
 NVFP4_AWQ_LITE_CFG = _nvfp4_selective_quant_cfg(["*"], algorithm="awq_lite")
+
+NVFP4_AWQ_EXPERTS_ONLY_CFG = _nvfp4_selective_quant_cfg(
+    ["*mlp.experts*", "*block_sparse_moe*"], algorithm="awq_lite"
+)
 
 NVFP4_AWQ_CLIP_CFG = _nvfp4_selective_quant_cfg(["*"], algorithm={"method": "awq_clip"})
 
@@ -813,6 +877,7 @@ choices: set[str] = {
     "MXINT8_DEFAULT_CFG",
     "NVFP4_AFFINE_KV_CFG",
     "NVFP4_AWQ_CLIP_CFG",
+    "NVFP4_AWQ_EXPERTS_ONLY_CFG",
     "NVFP4_AWQ_FULL_CFG",
     "NVFP4_AWQ_LITE_CFG",
     "NVFP4_DEFAULT_CFG",
@@ -827,6 +892,8 @@ choices: set[str] = {
     "MXFP4_MLP_WEIGHT_ONLY_CFG",
     "NVFP4_MLP_ONLY_CFG",
     "NVFP4_EXPERTS_ONLY_CFG",
+    "NVFP4_LOCAL_HESSIAN_EXPERTS_ONLY_CFG",
+    "NVFP4_LOCAL_HESSIAN_MIDDLE_MOE_EXPERTS_ONLY_CFG",
     "NVFP4_OMLP_ONLY_CFG",
     "MAMBA_MOE_NVFP4_CONSERVATIVE_CFG",
     "MAMBA_MOE_NVFP4_AGGRESSIVE_CFG",

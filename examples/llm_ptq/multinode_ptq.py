@@ -50,6 +50,7 @@ QUANT_CFG_CHOICES: dict[str, dict[str, Any]] = {
     "fp8": mtq.FP8_DEFAULT_CFG,
     "nvfp4": mtq.NVFP4_DEFAULT_CFG,
     "nvfp4_awq": mtq.NVFP4_AWQ_LITE_CFG,
+    "nvfp4_awq_experts_only": mtq.NVFP4_AWQ_EXPERTS_ONLY_CFG,
     "w4a8_mxfp4_fp8": mtq.W4A8_MXFP4_FP8_CFG,
     "nvfp4_mlp_only": mtq.NVFP4_MLP_ONLY_CFG,
     "nvfp4_experts_only": mtq.NVFP4_EXPERTS_ONLY_CFG,

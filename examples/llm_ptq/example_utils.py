@@ -212,17 +212,18 @@ def build_quant_cfg(
 ) -> dict[str, Any]:
     quant_cfg = copy.deepcopy(quant_cfg)
     if "awq" in str(quant_cfg.get("algorithm")):
-        from modelopt.torch.quantization.config import find_quant_cfg_entry_by_path
-
-        weight_quantizer_entry = find_quant_cfg_entry_by_path(
-            quant_cfg["quant_cfg"], "*weight_quantizer"
-        )
-        weight_quantizer = weight_quantizer_entry.get("cfg") or {}
-        if isinstance(weight_quantizer, list):
-            weight_quantizer = weight_quantizer[0]
         # If awq_block_size argument is provided, update weight_quantizer
         if awq_block_size:
-            weight_quantizer["block_sizes"][-1] = awq_block_size
+            for entry in quant_cfg["quant_cfg"]:
+                if not entry.get("quantizer_name", "").endswith("weight_quantizer"):
+                    continue
+                weight_quantizer_cfgs = entry.get("cfg") or []
+                if isinstance(weight_quantizer_cfgs, dict):
+                    weight_quantizer_cfgs = [weight_quantizer_cfgs]
+                for weight_quantizer in weight_quantizer_cfgs:
+                    block_sizes = weight_quantizer.get("block_sizes")
+                    if block_sizes is not None:
+                        block_sizes[-1] = awq_block_size
 
         # Coarser optimal scale search seems to resolve the overflow in TRT-LLM for some models
         if qformat == "w4a8_awq" and model_type in ["gemma", "mpt"]:

@@ -560,6 +560,106 @@ def local_hessian_calibrate(
         warnings.warn("forward_loop must be provided for local_hessian; skipping local_hessian")
         return
 
+    def _get_module_tensor_attr(module: nn.Module, attr_name: str) -> torch.Tensor | None:
+        attr = module._parameters.get(attr_name)
+        if attr is None:
+            attr = module._buffers.get(attr_name)
+        if attr is None:
+            attr = module.__dict__.get(attr_name)
+        return attr if isinstance(attr, torch.Tensor) else None
+
+    def _normalize_weight_shape(weight_shape) -> tuple[int, int] | None:
+        if isinstance(weight_shape, torch.Tensor):
+            weight_shape = weight_shape.detach().cpu().tolist()
+        if isinstance(weight_shape, torch.Size):
+            weight_shape = tuple(weight_shape)
+        if isinstance(weight_shape, (list, tuple)) and len(weight_shape) >= 2:
+            return int(weight_shape[-2]), int(weight_shape[-1])
+        return None
+
+    def _infer_weight_shape(module: nn.Module) -> tuple[int, int]:
+        get_shape = getattr(module, "get_uncompressed_weight_shape", None)
+        if callable(get_shape):
+            shape = _normalize_weight_shape(get_shape())
+            if shape is not None:
+                return shape
+
+        weight = _get_module_tensor_attr(module, "weight")
+        if weight is not None:
+            shape = _normalize_weight_shape(weight.shape)
+            if shape is not None:
+                return shape
+
+        weight_shape = getattr(module, "weight_shape", None)
+        shape = _normalize_weight_shape(weight_shape)
+        if shape is not None:
+            return shape
+
+        out_features = getattr(module, "out_features", None)
+        in_features = getattr(module, "in_features", None)
+        if out_features is not None and in_features is not None:
+            return int(out_features), int(in_features)
+
+        raise RuntimeError(f"Cannot infer weight shape for local_hessian module {module}.")
+
+    def _infer_weight_device(module: nn.Module) -> torch.device:
+        for attr_name in ("weight", "weight_packed", "weight_scale"):
+            attr = _get_module_tensor_attr(module, attr_name)
+            if attr is not None:
+                return attr.device
+        for tensor in list(module.parameters(recurse=False)) + list(module.buffers(recurse=False)):
+            return tensor.device
+        return torch.device("cpu")
+
+    def _is_local_hessian_linear(module: nn.Module) -> bool:
+        if is_quantized_linear(module):
+            return True
+        return (
+            isinstance(module, QuantModule)
+            and isinstance(getattr(module, "input_quantizer", None), TensorQuantizer)
+            and hasattr(module, "weight_quantizer")
+            and (
+                callable(getattr(module, "get_uncompressed_weight_shape", None))
+                or _normalize_weight_shape(getattr(module, "weight_shape", None)) is not None
+                or _get_module_tensor_attr(module, "weight_packed") is not None
+            )
+        )
+
+    def _is_nvfp4_static_quantizer(weight_quantizer: TensorQuantizer) -> bool:
+        block_sizes = getattr(weight_quantizer, "_block_sizes", None)
+        return (
+            weight_quantizer.is_static_block_quant
+            and weight_quantizer._num_bits == (2, 1)
+            and block_sizes is not None
+            and block_sizes.get("scale_bits") == (4, 3)
+        )
+
+    def _promote_nvfp4_static_quantizer(
+        weight_quantizer: TensorQuantizer, initial_amax: torch.Tensor | None
+    ) -> None:
+        if not _is_nvfp4_static_quantizer(weight_quantizer):
+            return
+        global_amax = reduce_amax(initial_amax, axis=None) if initial_amax is not None else None
+        NVFP4StaticQuantizer.from_tensor_quantizer(weight_quantizer, global_amax=global_amax)
+
+    def _promote_all_nvfp4_static_weight_quantizers() -> int:
+        promoted = 0
+        for module in name_to_module.values():
+            weight_quantizer = getattr(module, "weight_quantizer", None)
+            if not isinstance(weight_quantizer, TensorQuantizer):
+                continue
+            if not getattr(weight_quantizer, "is_enabled", False):
+                continue
+            if not _is_nvfp4_static_quantizer(weight_quantizer):
+                continue
+            was_static = isinstance(weight_quantizer, NVFP4StaticQuantizer)
+            has_amax = hasattr(weight_quantizer, "_amax") and weight_quantizer._amax is not None
+            initial_amax = weight_quantizer._amax.clone().detach() if has_amax else None
+            _promote_nvfp4_static_quantizer(weight_quantizer, initial_amax)
+            if not was_static:
+                promoted += 1
+        return promoted
+
     class LocalHessianHelper:
         """Helper class to collect activations and compute local Hessian per module."""
 
@@ -568,11 +668,12 @@ def local_hessian_calibrate(
         def __init__(self, module, name):
             self.name = name
             self.module = module
-            self.weight_shape = module.weight.shape  # (cout, cin)
+            self.weight_shape = _infer_weight_shape(module)  # (cout, cin)
             self.cout, self.cin = self.weight_shape
             self.block_size = block_size
             self.num_blocks_per_cin = self.cin // block_size
             self.is_enabled = True
+            self.weight_device = _infer_weight_device(module)
 
             # Accumulated Hessian per block: (cin // block_size, block_size, block_size)
             self.hessian_per_block = torch.zeros(
@@ -580,7 +681,7 @@ def local_hessian_calibrate(
                 block_size,
                 block_size,
                 dtype=torch.float32,
-                device=module.weight.device,
+                device=self.weight_device,
             )
             self.num_samples = 0
 
@@ -619,6 +720,8 @@ def local_hessian_calibrate(
 
             # Compute H = X @ X.T for each block and accumulate
             hessian_batch = (x @ x.transpose(-1, -2)).to(torch.float32)
+            if hessian_batch.device != self.hessian_per_block.device:
+                hessian_batch = hessian_batch.to(self.hessian_per_block.device)
             self.hessian_per_block += hessian_batch
             self.num_samples += input_tensor.numel() // self.cin
 
@@ -628,15 +731,22 @@ def local_hessian_calibrate(
             bs = self.block_size
             # Normalize hessian by number of samples
             hessian = self.hessian_per_block / max(self.num_samples, 1)
+            hessian_cache: dict[torch.device, torch.Tensor] = {}
 
             def local_hessian_error(x: torch.Tensor, xq: torch.Tensor) -> torch.Tensor:
                 """Compute local Hessian-weighted error."""
                 original_shape = x.shape
                 # Reshape to (cout, num_blocks_per_cin, block_size)
                 dw = (x - xq).view(cout, -1, bs)
+                hessian_for_x = hessian
+                if hessian_for_x.device != x.device:
+                    hessian_for_x = hessian_cache.get(x.device)
+                    if hessian_for_x is None:
+                        hessian_for_x = hessian.to(x.device)
+                        hessian_cache[x.device] = hessian_for_x
                 # Use einsum to avoid materializing cout-repeated Hessian
                 # dw: (cout, n_blocks, bs), hessian: (n_blocks, bs, bs) -> (cout, n_blocks)
-                block_loss = torch.einsum("cnb,nbd,cnd->cn", dw, hessian, dw)
+                block_loss = torch.einsum("cnb,nbd,cnd->cn", dw, hessian_for_x, dw)
                 block_loss = block_loss.reshape(-1)
                 error = block_loss.unsqueeze(-1).expand(-1, bs).reshape(original_shape)
                 return error
@@ -653,8 +763,10 @@ def local_hessian_calibrate(
         # Forward without quantization during caching
         if LocalHessianHelper.cache_mode:
             self.weight_quantizer.disable()
-            out = self._forward_no_local_hessian(input, *args, **kwargs)
-            self.weight_quantizer.enable()
+            try:
+                out = self._forward_no_local_hessian(input, *args, **kwargs)
+            finally:
+                self.weight_quantizer.enable()
             return out
 
         return self._forward_no_local_hessian(input, *args, **kwargs)
@@ -669,136 +781,147 @@ def local_hessian_calibrate(
     weight_quantizers_info = []
     all_patched_modules = []  # Track all modules for cleanup (including disabled ones)
 
-    for name, module in name_to_module.items():
-        if is_quantized_linear(module) and module.weight_quantizer.is_enabled:
-            with enable_weight_access_and_writeback(module, model, name_to_module):
+    try:
+        for name, module in name_to_module.items():
+            if _is_local_hessian_linear(module) and module.weight_quantizer.is_enabled:
                 module.hessian_helper = LocalHessianHelper(module, name)
-            module.hessian_helper.setup()
-            all_patched_modules.append((name, module))
-            if module.hessian_helper.is_enabled:
-                weight_quantizers_info.append((name, module))
+                all_patched_modules.append((name, module))
+                module.hessian_helper.setup()
+                if module.hessian_helper.is_enabled:
+                    weight_quantizers_info.append((name, module))
 
-    # Cache activations by running forward loop
-    LocalHessianHelper.cache_mode = True
-    print_rank_0("local_hessian: Caching activations and computing local Hessian...")
-    forward_loop(model)
+        # Cache activations by running forward loop
+        LocalHessianHelper.cache_mode = True
+        print_rank_0("local_hessian: Caching activations and computing local Hessian...")
+        forward_loop(model)
+        LocalHessianHelper.cache_mode = False
 
-    # TODO(fridah-nv): Sync Hessian across distributed processes if needed
+        # TODO(fridah-nv): Sync Hessian across distributed processes if needed
 
-    # Replace calibrators with MseCalibrator using local Hessian error function
-    print_rank_0("local_hessian: Running MSE calibration with local Hessian loss...")
-    for name, module in weight_quantizers_info:
-        weight_quantizer = module.weight_quantizer
-        helper = module.hessian_helper
+        # Replace calibrators with MseCalibrator using local Hessian error function
+        print_rank_0("local_hessian: Running MSE calibration with local Hessian loss...")
+        skip_weight_quantizer_ids: set[int] = set()
+        for name, module in weight_quantizers_info:
+            weight_quantizer = module.weight_quantizer
+            helper = module.hessian_helper
 
-        if not hasattr(weight_quantizer, "_amax") or weight_quantizer._amax is None:
-            continue
+            has_amax = hasattr(weight_quantizer, "_amax") and weight_quantizer._amax is not None
+            initial_amax = weight_quantizer._amax.clone().detach() if has_amax else None
 
-        initial_amax = weight_quantizer._amax.clone().detach()
+            def quant_func(x, amax, quantizer=weight_quantizer):
+                original_amax = quantizer._amax.clone() if hasattr(quantizer, "_amax") else None
+                quantizer._amax = amax
 
-        def quant_func(x, amax, quantizer=weight_quantizer):
-            original_amax = quantizer._amax.clone() if hasattr(quantizer, "_amax") else None
-            quantizer._amax = amax
+                with (
+                    enable_quant(quantizer),
+                    disable_calib(quantizer),
+                    enable_fake_quant(quantizer),
+                ):
+                    if hasattr(quantizer, "_original_shape"):
+                        x = quantizer._reset_to_original_shape(x)
+                    xq = quantizer(x)
+                    if hasattr(quantizer, "_block_reshape_size"):
+                        xq = xq.reshape(quantizer._block_reshape_size)
 
-            with (
-                enable_quant(quantizer),
-                disable_calib(quantizer),
-                enable_fake_quant(quantizer),
-            ):
-                if hasattr(quantizer, "_original_shape"):
-                    x = quantizer._reset_to_original_shape(x)
-                xq = quantizer(x)
-                if hasattr(quantizer, "_block_reshape_size"):
-                    xq = xq.reshape(quantizer._block_reshape_size)
+                if original_amax is not None:
+                    quantizer._amax = original_amax
+                else:
+                    delattr(quantizer, "_amax")
 
-            if original_amax is not None:
-                quantizer._amax = original_amax
+                return xq
+
+            is_nvfp4_static = _is_nvfp4_static_quantizer(weight_quantizer)
+
+            if is_nvfp4_static:
+                _promote_nvfp4_static_quantizer(weight_quantizer, initial_amax)
+
+            if initial_amax is None:
+                warnings.warn(
+                    f"Module {name}: no max-calibrated weight amax; "
+                    "falling back to weight-derived NVFP4 scales during export."
+                )
+                skip_weight_quantizer_ids.add(id(weight_quantizer))
+                continue
+
+            if helper.num_samples == 0:
+                warnings.warn(
+                    f"Module {name}: no calibration tokens reached this module; "
+                    "falling back to max-calibrated weight scale."
+                )
+                skip_weight_quantizer_ids.add(id(weight_quantizer))
+                continue
+
+            error_func = helper.get_error_func()
+
+            if fp8_scale_sweep and is_nvfp4_static:
+                weight_quantizer._calibrator = NVFP4MSECalibrator(
+                    amax=initial_amax,
+                    axis=weight_quantizer._calibrator._axis if weight_quantizer._calibrator else None,
+                    global_amax=weight_quantizer.global_amax,
+                    quant_func=quant_func,
+                    error_func=error_func,
+                )
             else:
-                delattr(quantizer, "_amax")
+                weight_quantizer._calibrator = MseCalibrator(
+                    amax=initial_amax,
+                    axis=weight_quantizer._calibrator._axis if weight_quantizer._calibrator else None,
+                    step_size=step_size,
+                    start_multiplier=start_multiplier,
+                    stop_multiplier=stop_multiplier,
+                    quant_func=quant_func,
+                    error_func=error_func,
+                )
 
-            return xq
+        # Process weights ONE AT A TIME with immediate amax computation and cleanup
+        weight_list = [
+            (name, module)
+            for name, module in weight_quantizers_info
+            if id(module.weight_quantizer) not in skip_weight_quantizer_ids
+            and module.weight_quantizer._calibrator is not None
+        ]
 
-        is_nvfp4_static = (
-            weight_quantizer.is_static_block_quant
-            and weight_quantizer._num_bits == (2, 1)
-            and weight_quantizer._block_sizes is not None
-            and weight_quantizer._block_sizes.get("scale_bits") == (4, 3)
-        )
+        for name, module in weight_list:
+            weight_quantizer = module.weight_quantizer
+            cal = weight_quantizer._calibrator
 
-        if is_nvfp4_static:
-            global_amax = reduce_amax(initial_amax, axis=None)
-            NVFP4StaticQuantizer.from_tensor_quantizer(weight_quantizer, global_amax=global_amax)
+            try:
+                # Step 1: Calibrate this weight
+                weight_quantizer.disable_quant()
+                weight_quantizer.enable_calib()
+                with enable_weight_access_and_writeback(module, model, name_to_module):
+                    weight = module.weight
+                    weight_quantizer(weight)
 
-        error_func = helper.get_error_func()
+                # Step 2: IMMEDIATELY compute amax before calibration data grows
+                if cal.compute_amax() is not None:
+                    weight_quantizer.load_calib_amax()
+            finally:
+                weight_quantizer.enable_quant()
+                weight_quantizer.disable_calib()
 
-        if fp8_scale_sweep and is_nvfp4_static:
-            weight_quantizer._calibrator = NVFP4MSECalibrator(
-                amax=initial_amax,
-                axis=weight_quantizer._calibrator._axis if weight_quantizer._calibrator else None,
-                global_amax=weight_quantizer.global_amax,
-                quant_func=quant_func,
-                error_func=error_func,
-            )
-        else:
-            weight_quantizer._calibrator = MseCalibrator(
-                amax=initial_amax,
-                axis=weight_quantizer._calibrator._axis if weight_quantizer._calibrator else None,
-                step_size=step_size,
-                start_multiplier=start_multiplier,
-                stop_multiplier=stop_multiplier,
-                quant_func=quant_func,
-                error_func=error_func,
-            )
+            if torch.cuda.is_available():
+                for dev_id in range(torch.cuda.device_count()):
+                    torch.cuda.synchronize(torch.device(f"cuda:{dev_id}"))
 
-    # Free cached memory before heavy calibration
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+            if hasattr(cal, "reset"):
+                cal.reset()
 
-    # Process weights ONE AT A TIME with immediate amax computation and cleanup
-    weight_list = [
-        (name, module)
-        for name, module in weight_quantizers_info
-        if module.weight_quantizer._calibrator is not None
-    ]
-
-    for idx, (name, module) in enumerate(weight_list):
-        weight_quantizer = module.weight_quantizer
-        cal = weight_quantizer._calibrator
-
-        # Step 1: Calibrate this weight
-        weight_quantizer.disable_quant()
-        weight_quantizer.enable_calib()
-        with enable_weight_access_and_writeback(module, model, name_to_module):
-            weight = module.weight
-            weight_quantizer(weight)
-
-        # Step 2: IMMEDIATELY compute amax (before calibration data grows)
-        if cal.compute_amax() is not None:
-            weight_quantizer.load_calib_amax()
-
-        weight_quantizer.enable_quant()
-        weight_quantizer.disable_calib()
-
-        # Step 3: Sync all devices and reset calibrator for next weight
         if torch.cuda.is_available():
             for dev_id in range(torch.cuda.device_count()):
                 torch.cuda.synchronize(torch.device(f"cuda:{dev_id}"))
 
-        if hasattr(cal, "reset"):
-            cal.reset()
-
-        if (idx + 1) % 10 == 0 and torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    if torch.cuda.is_available():
-        for dev_id in range(torch.cuda.device_count()):
-            torch.cuda.synchronize(torch.device(f"cuda:{dev_id}"))
-        torch.cuda.empty_cache()
-
-    # Cleanup and free memory
-    LocalHessianHelper.cache_mode = False
-    for name, module in all_patched_modules:
-        module.hessian_helper.cleanup()
+        promoted = _promote_all_nvfp4_static_weight_quantizers()
+        if promoted:
+            print_rank_0(
+                f"local_hessian: Promoted {promoted} NVFP4 static weight quantizers "
+                "for export fallback."
+            )
+    finally:
+        LocalHessianHelper.cache_mode = False
+        for _name, module in all_patched_modules:
+            helper = getattr(module, "hessian_helper", None)
+            if helper is not None:
+                helper.cleanup()
 
     print_rank_0("local_hessian: Calibration complete.")
 
@@ -885,7 +1008,10 @@ _ENABLE_FOLDING_PQS_TO_WEIGHTS = True
 
 @torch.no_grad()
 def _apply_weight_pre_quant_scale(linear, pre_quant_scale):
-    if _ENABLE_FOLDING_PQS_TO_WEIGHTS:
+    apply_weight_smooth_scale = getattr(linear, "apply_weight_smooth_scale", None)
+    if _ENABLE_FOLDING_PQS_TO_WEIGHTS and callable(apply_weight_smooth_scale):
+        apply_weight_smooth_scale(pre_quant_scale)
+    elif _ENABLE_FOLDING_PQS_TO_WEIGHTS:
         linear.weight.data.copy_(
             (linear.weight * pre_quant_scale.to(linear.weight.device).squeeze()[None, :]).to(
                 linear.weight.dtype
@@ -898,7 +1024,12 @@ def _apply_weight_pre_quant_scale(linear, pre_quant_scale):
         )
 
     linear.weight_quantizer.reset_amax()
-    max_calibrate(linear, lambda linear: linear.weight_quantizer(linear.weight))
+    enable_weight_access = getattr(linear, "enable_weight_access_and_writeback", None)
+    if callable(enable_weight_access):
+        with enable_weight_access():
+            max_calibrate(linear, lambda linear: linear.weight_quantizer(linear.weight))
+    else:
+        max_calibrate(linear, lambda linear: linear.weight_quantizer(linear.weight))
 
 
 @torch.no_grad()
@@ -1099,6 +1230,7 @@ def awq_lite(
             self.act_scale = 0.0
             self.num_cache_steps = 0
             self.num_search_steps = 0
+            self.weight_dtype = module.weight.dtype
             self.block_size = _get_awq_quantizer_block_size(module.weight, module.weight_quantizer)
             self.weight_scale = get_weight_scale(module.weight, self.block_size)
             self.loss = {
@@ -1227,8 +1359,11 @@ def awq_lite(
                     else None
                 ),
             )
-            self.input_quantizer.pre_quant_scale = (1 / awq_scale).to(self.weight.dtype)
-            self.weight_quantizer.pre_quant_scale = awq_scale.to(self.weight.dtype)
+            weight_dtype = getattr(self.awq_lite, "weight_dtype", None)
+            if weight_dtype is None:
+                weight_dtype = self.weight.dtype
+            self.input_quantizer.pre_quant_scale = (1 / awq_scale).to(weight_dtype)
+            self.weight_quantizer.pre_quant_scale = awq_scale.to(weight_dtype)
             out = self._forward_no_awq(input, *args, **kwargs)
             update_loss(self, out, out_actual, alpha)
 
@@ -1237,11 +1372,23 @@ def awq_lite(
         # Now forward the actual output without any quantization
         return out_actual
 
+    def is_awq_linear(module):
+        if is_quantized_linear(module):
+            return True
+        return (
+            isinstance(module, QuantModule)
+            and isinstance(getattr(module, "input_quantizer", None), TensorQuantizer)
+            and hasattr(module, "weight_quantizer")
+            and callable(getattr(module, "enable_weight_access_and_writeback", None))
+        )
+
     # Pre-compute name_to_module dict ONCE to avoid O(n^2) complexity in enable_weight_access_and_writeback
     name_to_module = dict(model.named_modules())
     for name, module in name_to_module.items():
-        if is_quantized_linear(module) and module.weight_quantizer.is_enabled:
+        if is_awq_linear(module) and module.weight_quantizer.is_enabled:
             with enable_weight_access_and_writeback(module, model, name_to_module):
+                if not is_quantized_linear(module):
+                    continue
                 module.awq_lite = AWQLiteHelper(module, name)
             module.awq_lite.setup()
 
@@ -1267,7 +1414,7 @@ def awq_lite(
 
     for name, module in model.named_modules():
         if (
-            is_quantized_linear(module)
+            is_awq_linear(module)
             and hasattr(module, "awq_lite")
             and module.awq_lite.num_cache_steps > 0
         ):
@@ -1295,7 +1442,7 @@ def awq_lite(
     # pre_quant_scale are applied in the postprocessing loop below.
     for name, module in model.named_modules():
         if (
-            is_quantized_linear(module)
+            is_awq_linear(module)
             and hasattr(module, "awq_lite")
             and module.awq_lite.num_cache_steps == 0
         ):
@@ -1331,6 +1478,10 @@ def awq_lite(
             warnings.warn(f"awq_lite: Disabling for {name}, quantizing with max calibration.")
             max_calibrate(module, lambda module: module.weight_quantizer(module.weight))
 
+    def restore_input_pre_quant_scale(module, pre_quant_scale):
+        module.input_quantizer._enable_pre_quant_scale = True
+        module.input_quantizer.pre_quant_scale = pre_quant_scale
+
     for name, module in model.named_modules():
         if hasattr(module, "awq_lite"):
             if module.awq_lite.num_cache_steps == 0:
@@ -1352,6 +1503,8 @@ def awq_lite(
                     device=w_device,
                 )
             else:
+                pre_quant_scale_to_restore = None
+                w_shape, w_dtype, w_device = None, None, None
                 if module.awq_lite.num_search_steps == 0:
                     module.awq_lite.is_enabled = False
                     warnings.warn(
@@ -1360,7 +1513,33 @@ def awq_lite(
                         " that can be used to forward data through the model many times."
                     )
                 with enable_weight_access_and_writeback(module, model, name_to_module):
+                    w_shape, w_dtype, w_device = (
+                        module.weight.shape[1],
+                        module.weight.dtype,
+                        module.weight.device,
+                    )
                     postprocess(module, name)
+                    if hasattr(module.input_quantizer, "_pre_quant_scale"):
+                        pre_quant_scale_to_restore = (
+                            module.input_quantizer._pre_quant_scale.detach().clone()
+                        )
+
+                # Some HF accelerate/offload hooks drop buffers registered inside
+                # weight-access contexts. Re-register the input-side AWQ scale
+                # outside that context so export sees NVFP4_AWQ rather than NVFP4.
+                if pre_quant_scale_to_restore is None:
+                    if module.awq_lite.is_enabled and module.awq_lite.best_scale is not None:
+                        pre_quant_scale_to_restore = (1.0 / module.awq_lite.best_scale).to(
+                            dtype=w_dtype,
+                            device=w_device,
+                        )
+                    else:
+                        pre_quant_scale_to_restore = torch.ones(
+                            w_shape,
+                            dtype=w_dtype,
+                            device=w_device,
+                        )
+                restore_input_pre_quant_scale(module, pre_quant_scale_to_restore)
 
             module.awq_lite.cleanup()
             if not debug:
