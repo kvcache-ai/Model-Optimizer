@@ -204,6 +204,39 @@ def _move_batch_to_device(batch: dict, device: torch.device) -> dict:
     return {k: _to_device(v) for k, v in batch.items()}
 
 
+def _augment_algorithm_with_resume_cfg(
+    algorithm_cfg: str | dict[str, Any] | None, args: argparse.Namespace
+) -> str | dict[str, Any] | None:
+    """Attach strict resume config to PTQ algorithm config when requested."""
+    if args.resume_checkpoint_dir is None:
+        return algorithm_cfg
+
+    if algorithm_cfg is None:
+        return algorithm_cfg
+
+    cfg = copy.deepcopy(algorithm_cfg)
+    if isinstance(cfg, str):
+        cfg = {"method": cfg}
+    if not isinstance(cfg, dict):
+        warnings.warn(
+            f"Unsupported algorithm config type {type(cfg)} for strict resume. "
+            "Ignoring --resume_checkpoint_dir."
+        )
+        return algorithm_cfg
+
+    if cfg.get("layerwise", False):
+        warnings.warn(
+            "Ignoring strict resume settings because layerwise=True is enabled. "
+            "Use layerwise_checkpoint_dir for layerwise resume."
+        )
+        return cfg
+
+    cfg["resume_checkpoint_dir"] = args.resume_checkpoint_dir
+    cfg["resume_save_interval"] = args.resume_save_interval
+    cfg["resume_keep_checkpoint"] = args.resume_keep_checkpoint
+    return cfg
+
+
 def make_calib_dataloader(
     args: argparse.Namespace,
     language_model: torch.nn.Module,
@@ -651,11 +684,12 @@ def mono_quantize(
             if args.calib_with_images and is_nemotron_vl_model:
                 calibrate_loop = create_vlm_calibration_loop(full_model, calib_dataloader)
             else:
+                allowed_non_tensor_keys = (
+                    {"base_model_outputs"} if args.specdec_offline_dataset is not None else None
+                )
                 calibrate_loop = create_forward_loop(
                     dataloader=calib_dataloader,
-                    allowed_non_tensor_keys={"base_model_outputs"}
-                    if args.specdec_offline_dataset is not None
-                    else None,
+                    allowed_non_tensor_keys=allowed_non_tensor_keys,
                 )
 
         if calibration_only:
@@ -1002,6 +1036,12 @@ def quantize_main(
     default_pad_token,
     device: torch.device,
 ):
+    if args.resume_checkpoint_dir is not None and args.auto_quantize_bits:
+        warnings.warn(
+            "auto_quantize already has native checkpoint support via --auto_quantize_checkpoint. "
+            "Ignoring --resume_checkpoint_dir."
+        )
+
     if args.batch_size == 0:
         # For VL models with image-text calibration, skip automatic batch size detection
         # since get_max_batch_size can't handle multimodal inputs
@@ -1130,6 +1170,11 @@ def quantize_main(
             print(
                 f"Auto-resolved layerwise_checkpoint_dir: {quant_cfg['algorithm']['layerwise_checkpoint_dir']}"
             )
+
+        quant_cfg = copy.deepcopy(quant_cfg)
+        quant_cfg["algorithm"] = _augment_algorithm_with_resume_cfg(
+            quant_cfg.get("algorithm"), args
+        )
 
         if args.qformat in QUANT_CFG_CHOICES:
             mono_quantize(
@@ -1383,8 +1428,32 @@ def parse_args() -> argparse.Namespace:
         help="Export as vLLM fake-quant checkpoint (produces vllm_fq_modelopt_state.pth "
         "for use with vllm_serve_fakequant.py).",
     )
+    parser.add_argument(
+        "--resume_checkpoint_dir",
+        type=str,
+        default=None,
+        help=(
+            "Directory used for non-layerwise PTQ resume checkpoints. "
+            "When set, calibration progress and ModelOpt state are periodically checkpointed "
+            "and can be resumed after interruption."
+        ),
+    )
+    parser.add_argument(
+        "--resume_save_interval",
+        type=int,
+        default=16,
+        help="Save strict resume checkpoint every N calibration steps.",
+    )
+    parser.add_argument(
+        "--resume_keep_checkpoint",
+        default=False,
+        action="store_true",
+        help="Keep strict resume checkpoint files after successful calibration.",
+    )
 
     args = parser.parse_args()
+    if args.resume_save_interval <= 0:
+        parser.error("--resume_save_interval must be > 0.")
     if args.moe_calib_experts_ratio is not None and not (0.0 < args.moe_calib_experts_ratio <= 1.0):
         parser.error("--moe_calib_experts_ratio must be in the range (0.0, 1.0].")
 

@@ -16,6 +16,7 @@
 """Utility functions for getting samples and forward loop function for different datasets."""
 
 import copy
+import itertools
 import json
 import os
 from collections.abc import Callable
@@ -593,6 +594,8 @@ def _forward_loop(
     model: torch.nn.Module,
     dataloader: DataLoader,
     allowed_non_tensor_keys: set | None = None,
+    start_step: int = 0,
+    step_callback: Callable[[int], None] | None = None,
 ) -> None:
     """Runs forward passes through the model using data from the dataloader.
 
@@ -600,6 +603,9 @@ def _forward_loop(
         model: The PyTorch model to run inference on
         dataloader: DataLoader containing the batched input data
         allowed_non_tensor_keys: Set of key names whose values may be non-tensor types
+        start_step: Number of initial batches to skip before forwarding.
+        step_callback: Optional callback invoked after each forwarded batch with
+            one-based absolute step index.
     """
     # Disable KV caching during calibration — it is unnecessary overhead and causes
     # correctness issues with hybrid Mamba/attention models whose cache state is mutated
@@ -615,11 +621,21 @@ def _forward_loop(
             infer_method = model.generate if is_enc_dec else model.forward
             max_working_batch_size = None  # Initialize max working batch size as None
 
-            for _, data in enumerate(tqdm(dataloader)):
+            iterator = enumerate(dataloader, start=1)
+            if start_step > 0:
+                iterator = itertools.islice(iterator, start_step, None)
+            try:
+                total_steps = len(dataloader)
+                tqdm_total = max(total_steps - max(start_step, 0), 0)
+            except TypeError:
+                tqdm_total = None
+            for step, data in tqdm(iterator, total=tqdm_total):
                 # Process batch and update max working batch size
                 max_working_batch_size = _process_batch(
                     data, infer_method, max_working_batch_size, allowed_non_tensor_keys
                 )
+                if step_callback is not None:
+                    step_callback(step)
     finally:
         if config is not None and prev_use_cache is not None:
             config.use_cache = prev_use_cache
@@ -696,7 +712,25 @@ def create_forward_loop(
             include_labels=include_labels,
         )
 
-    return lambda model: _forward_loop(model, dataloader, allowed_non_tensor_keys)
+    def _loop(
+        model,
+        start_step: int = 0,
+        step_callback: Callable[[int], None] | None = None,
+    ):
+        return _forward_loop(
+            model,
+            dataloader,
+            allowed_non_tensor_keys,
+            start_step=start_step,
+            step_callback=step_callback,
+        )
+
+    _loop.supports_step_resume = True  # type: ignore[attr-defined]
+    try:
+        _loop.num_batches = len(dataloader)  # type: ignore[attr-defined]
+    except TypeError:
+        _loop.num_batches = None  # type: ignore[attr-defined]
+    return _loop
 
 
 def model_type_is_enc_dec(model):

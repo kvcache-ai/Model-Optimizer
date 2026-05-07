@@ -1303,6 +1303,32 @@ class QuantizeAlgorithmConfig(ModeloptBaseConfig):
             "completed layer."
         ),
     )
+    resume_checkpoint_dir: str | None = ModeloptField(
+        default=None,
+        title="Checkpoint directory for strict calibration resume.",
+        description=(
+            "If set, supported non-layerwise calibration algorithms periodically save "
+            "ModelOpt state and resume progress (for example, after interruption)."
+        ),
+    )
+    resume_save_interval: int = ModeloptField(
+        default=1,
+        ge=1,
+        title="Resume checkpoint save interval.",
+        description=(
+            "How often to save calibration resume checkpoints in supported algorithms. "
+            "For weight-loop algorithms (e.g. MSE/local_hessian), this is measured in "
+            "processed weight-quantizers."
+        ),
+    )
+    resume_keep_checkpoint: bool = ModeloptField(
+        default=False,
+        title="Keep resume checkpoints after successful completion.",
+        description=(
+            "If True, keep checkpoint artifacts after calibration finishes successfully. "
+            "If False, artifacts are removed on success."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_layerwise_checkpoint_dir(self):

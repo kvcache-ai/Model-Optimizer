@@ -20,6 +20,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import warnings
@@ -620,6 +621,71 @@ def get_model(
                     return True
             return False
 
+        def _glob_to_regex_target(target: str) -> str:
+            if target.startswith("re:"):
+                return target
+            if "*" not in target and "?" not in target:
+                return target
+            escaped = re.escape(target).replace(r"\*", ".*").replace(r"\?", ".")
+            return f"re:^{escaped}$"
+
+        def _normalize_ignore_patterns(qcfg: dict[str, Any]) -> bool:
+            ignore = qcfg.get("ignore")
+            if not isinstance(ignore, list):
+                return False
+            updated = False
+            normalized: list[str] = []
+            for item in ignore:
+                if not isinstance(item, str):
+                    normalized.append(item)
+                    continue
+                mapped = _glob_to_regex_target(item)
+                normalized.append(mapped)
+                updated = updated or mapped != item
+            if updated:
+                qcfg["ignore"] = normalized
+            return updated
+
+        def _extend_pack_quant_ignore_for_safe_loading(config) -> bool:
+            """Temporarily extend ignore patterns to avoid multimodal pack-quantized load errors."""
+            updated = False
+            extra_ignore_patterns = [
+                "re:.*lm_head$",
+                "re:.*vision.*",
+                "re:.*visual.*",
+                "re:.*image.*",
+                "re:.*mm_projector.*",
+                "re:.*projector.*",
+                "re:.*video.*",
+                "re:.*audio.*",
+                "re:.*speech.*",
+            ]
+            nodes: list[Any] = [config]
+            for attr in ("text_config", "language_config", "llm_config", "model_config", "vision_config"):
+                child = getattr(config, attr, None)
+                if child is not None:
+                    nodes.append(child)
+
+            for node in nodes:
+                qcfg = (
+                    node.get("quantization_config")
+                    if isinstance(node, dict)
+                    else getattr(node, "quantization_config", None)
+                )
+                if not isinstance(qcfg, dict):
+                    continue
+                updated = _normalize_ignore_patterns(qcfg) or updated
+                ignore = qcfg.get("ignore")
+                if ignore is None:
+                    qcfg["ignore"] = list(extra_ignore_patterns)
+                    updated = True
+                elif isinstance(ignore, list):
+                    for pat in extra_ignore_patterns:
+                        if pat not in ignore:
+                            ignore.append(pat)
+                            updated = True
+            return updated
+
         if is_speculative(hf_config):
             model = AutoModelForCausalLM.from_pretrained(
                 ckpt_path,
@@ -631,12 +697,15 @@ def get_model(
                 patch_compressed_linear_loading,
             )
 
+            if _extend_pack_quant_ignore_for_safe_loading(hf_config):
+                print("Temporarily extended pack-quantized ignore patterns for safe loading.")
+
             with patch_compressed_linear_loading():
                 model = AutoModelForCausalLM.from_pretrained(
                     ckpt_path,
-                    device_map="auto",
-                    trust_remote_code=trust_remote_code,
-                    dtype="auto",
+                    config=hf_config,
+                    device_map=device_map,
+                    **model_kwargs,
                 )
         else:
             architecture = hf_config.architectures[0]
