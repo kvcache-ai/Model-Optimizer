@@ -232,8 +232,11 @@ def _augment_algorithm_with_resume_cfg(
         return cfg
 
     cfg["resume_checkpoint_dir"] = args.resume_checkpoint_dir
-    cfg["resume_save_interval"] = args.resume_save_interval
+    cfg["resume_max_save_interval"] = args.resume_max_save_interval
+    cfg["resume_hessian_save_interval"] = args.resume_hessian_save_interval
+    cfg["resume_weight_save_interval"] = args.resume_weight_save_interval
     cfg["resume_keep_checkpoint"] = args.resume_keep_checkpoint
+    cfg["resume_extend_calib"] = args.resume_extend_calib
     return cfg
 
 
@@ -1439,10 +1442,22 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--resume_save_interval",
+        "--resume_max_save_interval",
         type=int,
-        default=16,
-        help="Save strict resume checkpoint every N calibration steps.",
+        default=4,
+        help="Save strict resume checkpoint every N max-calibration batches.",
+    )
+    parser.add_argument(
+        "--resume_hessian_save_interval",
+        type=int,
+        default=4,
+        help="Save strict resume checkpoint every N local-Hessian cache batches.",
+    )
+    parser.add_argument(
+        "--resume_weight_save_interval",
+        type=int,
+        default=256,
+        help="Save strict resume checkpoint every N weight-search quantizers.",
     )
     parser.add_argument(
         "--resume_keep_checkpoint",
@@ -1450,10 +1465,26 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Keep strict resume checkpoint files after successful calibration.",
     )
+    parser.add_argument(
+        "--resume_extend_calib",
+        default=False,
+        action="store_true",
+        help=(
+            "If --resume_checkpoint_dir points to a completed calibration checkpoint, "
+            "reuse its saved calibration state and treat the current calibration dataset "
+            "as additional data to append."
+        ),
+    )
 
     args = parser.parse_args()
-    if args.resume_save_interval <= 0:
-        parser.error("--resume_save_interval must be > 0.")
+    if args.resume_max_save_interval <= 0:
+        parser.error("--resume_max_save_interval must be > 0.")
+    if args.resume_hessian_save_interval <= 0:
+        parser.error("--resume_hessian_save_interval must be > 0.")
+    if args.resume_weight_save_interval <= 0:
+        parser.error("--resume_weight_save_interval must be > 0.")
+    if args.resume_extend_calib and args.resume_checkpoint_dir is None:
+        parser.error("--resume_extend_calib requires --resume_checkpoint_dir.")
     if args.moe_calib_experts_ratio is not None and not (0.0 < args.moe_calib_experts_ratio <= 1.0):
         parser.error("--moe_calib_experts_ratio must be in the range (0.0, 1.0].")
 

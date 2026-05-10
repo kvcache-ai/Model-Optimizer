@@ -37,7 +37,7 @@ from modelopt.torch.quantization.utils.layerwise_calib import (
     LayerActivationCollector,
     _CheckpointState,
 )
-from modelopt.torch.utils import print_rank_0
+from modelopt.torch.utils import get_unwrapped_name, print_rank_0
 from modelopt.torch.utils.distributed import DistributedProcessGroup, ParallelState
 from modelopt.torch.utils.network import bind_forward_method, unpatch_forward_method
 
@@ -103,16 +103,21 @@ class _CalibrationResumeCheckpoint:
         method: str,
         model: nn.Module,
         resume_checkpoint_dir: str | None,
-        resume_save_interval: int = 1,
+        resume_max_save_interval: int = 4,
+        resume_hessian_save_interval: int = 4,
+        resume_weight_save_interval: int = 256,
         resume_keep_checkpoint: bool = False,
         extra_signature_payload: dict | None = None,
     ):
         self.enabled = resume_checkpoint_dir is not None
         self.method = method
-        self.save_interval = max(int(resume_save_interval), 1)
+        self.max_save_interval = max(int(resume_max_save_interval), 1)
+        self.hessian_save_interval = max(int(resume_hessian_save_interval), 1)
+        self.weight_save_interval = max(int(resume_weight_save_interval), 1)
         self.keep_checkpoint = resume_keep_checkpoint
         self._state: dict[str, object] = {"stage": "start"}
         self._state_loaded = False
+        self._restored_quantizer_tensor_state = False
 
         if not self.enabled:
             self._checkpoint_dir = None
@@ -167,6 +172,18 @@ class _CalibrationResumeCheckpoint:
     def data(self) -> dict[str, object]:
         return self._state
 
+    @property
+    def restored_quantizer_tensor_state(self) -> bool:
+        return self._restored_quantizer_tensor_state
+
+    def _preserved_progress_state(self, extra_state: dict[str, object]) -> dict[str, object]:
+        """Carry progress markers across stage transitions unless explicitly overwritten."""
+        preserved = {}
+        for key in ("max_forward_step", "hessian_cache_step"):
+            if key in self._state and key not in extra_state:
+                preserved[key] = self._state[key]
+        return preserved
+
     @staticmethod
     def _atomic_write_json(path: Path, payload: dict[str, object]) -> None:
         tmp = path.with_suffix(path.suffix + ".tmp")
@@ -216,6 +233,24 @@ class _CalibrationResumeCheckpoint:
 
         print_rank_0(f"{self.method}: restoring modelopt state from {self._modelopt_path}")
         checkpoint_state = mto.load_modelopt_state(self._modelopt_path)
+        quantizer_tensor_state = checkpoint_state.get("modelopt_quantizer_state_dict")
+
+        def _restore_quantizer_tensor_state(model: nn.Module) -> nn.Module:
+            if not isinstance(quantizer_tensor_state, dict):
+                print_rank_0(
+                    f"{self.method}: resume checkpoint does not contain quantizer tensor state. "
+                    "Progress will restart from a safe calibration boundary."
+                )
+                return model
+
+            from .utils.core_utils import set_quantizer_state_dict
+
+            set_quantizer_state_dict(model, quantizer_tensor_state)
+            self._restored_quantizer_tensor_state = True
+            for name, module in model.named_modules():
+                if isinstance(module, QuantModule):
+                    module.modelopt_post_restore(get_unwrapped_name(name, model))
+            return model
 
         model_is_converted = False
         try:
@@ -245,9 +280,11 @@ class _CalibrationResumeCheckpoint:
             from .config import QuantizeConfig
             from .conversion import restore_quantizer_state
 
-            return restore_quantizer_state(model, QuantizeConfig(), metadata)
+            model = restore_quantizer_state(model, QuantizeConfig(), metadata)
+            return _restore_quantizer_tensor_state(model)
 
-        return mto.restore_from_modelopt_state(model, modelopt_state=checkpoint_state)
+        model = mto.restore_from_modelopt_state(model, modelopt_state=checkpoint_state)
+        return _restore_quantizer_tensor_state(model)
 
     def save(
         self,
@@ -262,9 +299,12 @@ class _CalibrationResumeCheckpoint:
             return
         assert self._state_path is not None and self._modelopt_path is not None
         import modelopt.torch.opt as mto
+        from .utils.core_utils import get_quantizer_state_dict
 
         modelopt_tmp = self._modelopt_path.with_suffix(".pth.tmp")
-        torch.save(mto.modelopt_state(model), modelopt_tmp)
+        checkpoint_state = mto.modelopt_state(model)
+        checkpoint_state["modelopt_quantizer_state_dict"] = get_quantizer_state_dict(model)
+        torch.save(checkpoint_state, modelopt_tmp)
         os.replace(modelopt_tmp, self._modelopt_path)
 
         if aux_state is not None:
@@ -281,6 +321,7 @@ class _CalibrationResumeCheckpoint:
             "method": self.method,
             "stage": stage,
             "updated_at_unix": time.time(),
+            **self._preserved_progress_state(extra_state),
             **extra_state,
         }
         self._atomic_write_json(self._state_path, payload)
@@ -455,13 +496,7 @@ def max_calibrate(
         last_step = max(int(max_forward_start_step), 0)
         max_loop_save_interval = None
         if resume is not None and resume.enabled:
-            total_batches = getattr(forward_loop, "num_batches", None)
-            if isinstance(total_batches, int) and total_batches > 0:
-                # Keep max-phase checkpointing lightweight: cap write frequency to
-                # roughly <=64 saves per max-calibration pass unless user asks for less.
-                max_loop_save_interval = max(resume.save_interval, max(total_batches // 64, 1))
-            else:
-                max_loop_save_interval = max(resume.save_interval, 64)
+            max_loop_save_interval = resume.max_save_interval
 
         def _on_step(step: int):
             nonlocal last_step
@@ -650,8 +685,11 @@ def mse_calibrate(
     stop_multiplier: float = 4.0,
     fp8_scale_sweep: bool = False,
     resume_checkpoint_dir: str | None = None,
-    resume_save_interval: int = 1,
+    resume_max_save_interval: int = 4,
+    resume_hessian_save_interval: int = 4,
+    resume_weight_save_interval: int = 256,
     resume_keep_checkpoint: bool = False,
+    resume_extend_calib: bool = False,
 ):
     """Calibrate the model using MSE-based amax search.
 
@@ -679,7 +717,9 @@ def mse_calibrate(
         method="mse",
         model=model,
         resume_checkpoint_dir=resume_checkpoint_dir,
-        resume_save_interval=resume_save_interval,
+        resume_max_save_interval=resume_max_save_interval,
+        resume_hessian_save_interval=resume_hessian_save_interval,
+        resume_weight_save_interval=resume_weight_save_interval,
         resume_keep_checkpoint=resume_keep_checkpoint,
         extra_signature_payload={
             "distributed_sync": bool(distributed_sync),
@@ -704,15 +744,23 @@ def mse_calibrate(
     if stage not in valid_stages:
         print_rank_0(f"MSE resume stage {stage!r} is invalid. Restarting from scratch.")
         stage = "start"
+    if resume.has_state and stage != "start" and not resume.restored_quantizer_tensor_state:
+        print_rank_0("MSE resume checkpoint is missing quantizer tensors. Restarting from scratch.")
+        stage = "start"
 
-    if stage == "done":
+    extend_completed_checkpoint = stage == "done" and resume_extend_calib
+    if extend_completed_checkpoint:
+        print_rank_0("MSE calibration checkpoint is complete; extending with additional data.")
+        resume.data["max_forward_step"] = 0
+        stage = "max_loop"
+    elif stage == "done":
         print_rank_0("MSE calibration already completed in existing resume checkpoint.")
         return
 
     if stage in {"start", "max_loop"}:
         # Step 1: First get initial amax using max calibration
         max_start = int(resume.data.get("max_forward_step", 0)) if stage == "max_loop" else 0
-        if max_start > 0:
+        if max_start > 0 or extend_completed_checkpoint:
             unsupported = _seed_calibrator_from_quantizer_amax(model)
             if unsupported:
                 print_rank_0(
@@ -798,7 +846,14 @@ def mse_calibrate(
         resume.save(model, "after_missing_weight_amax")
         stage = "after_missing_weight_amax"
 
-    if stage in {"after_missing_weight_amax", "after_max", "start"}:
+    rebuild_weight_calibrators = stage == "weight_loop"
+    if stage in {
+        "after_missing_weight_amax",
+        "after_calibrator_setup",
+        "after_max",
+        "start",
+        "weight_loop",
+    }:
         # Step 2: Replace calibrators with MseCalibrator
         for _, module in list(model.named_modules()):
             if isinstance(module, TensorQuantizer) and not module._disabled:
@@ -855,8 +910,9 @@ def mse_calibrate(
                         quant_func=partial(_mse_quant_func, quantizer=module),
                     )
 
-        resume.save(model, "after_calibrator_setup")
-        stage = "after_calibrator_setup"
+        if not rebuild_weight_calibrators:
+            resume.save(model, "after_calibrator_setup")
+            stage = "after_calibrator_setup"
 
     # Identify weight quantizers by checking if they have corresponding weight parameters.
     weight_quantizers: list[tuple[str, nn.Module, str, TensorQuantizer]] = []
@@ -921,7 +977,7 @@ def mse_calibrate(
             cal.reset()
 
         if resume.enabled and (
-            (idx + 1) % resume.save_interval == 0 or (idx + 1) == len(weight_quantizers)
+            (idx + 1) % resume.weight_save_interval == 0 or (idx + 1) == len(weight_quantizers)
         ):
             resume.save(
                 model,
@@ -958,8 +1014,11 @@ def local_hessian_calibrate(
     block_size: int = 16,
     debug: bool = False,
     resume_checkpoint_dir: str | None = None,
-    resume_save_interval: int = 1,
+    resume_max_save_interval: int = 4,
+    resume_hessian_save_interval: int = 4,
+    resume_weight_save_interval: int = 256,
     resume_keep_checkpoint: bool = False,
+    resume_extend_calib: bool = False,
 ):
     """Calibrate the model using local Hessian-weighted MSE search.
 
@@ -994,7 +1053,9 @@ def local_hessian_calibrate(
         method="local_hessian",
         model=model,
         resume_checkpoint_dir=resume_checkpoint_dir,
-        resume_save_interval=resume_save_interval,
+        resume_max_save_interval=resume_max_save_interval,
+        resume_hessian_save_interval=resume_hessian_save_interval,
+        resume_weight_save_interval=resume_weight_save_interval,
         resume_keep_checkpoint=resume_keep_checkpoint,
         extra_signature_payload={
             "distributed_sync": bool(distributed_sync),
@@ -1020,7 +1081,21 @@ def local_hessian_calibrate(
     if stage not in valid_stages:
         print_rank_0(f"local_hessian resume stage {stage!r} is invalid. Restarting from scratch.")
         stage = "start"
-    if stage == "done":
+    if resume.has_state and stage != "start" and not resume.restored_quantizer_tensor_state:
+        print_rank_0(
+            "local_hessian resume checkpoint is missing quantizer tensors. Restarting from scratch."
+        )
+        stage = "start"
+    extend_completed_checkpoint = stage == "done" and resume_extend_calib
+    if extend_completed_checkpoint:
+        print_rank_0(
+            "local_hessian calibration checkpoint is complete; extending max and hessian "
+            "statistics with additional data."
+        )
+        resume.data["max_forward_step"] = 0
+        resume.data["hessian_cache_step"] = 0
+        stage = "max_loop"
+    elif stage == "done":
         print_rank_0("local_hessian calibration already completed in existing resume checkpoint.")
         return
 
@@ -1285,7 +1360,7 @@ def local_hessian_calibrate(
     if stage in {"start", "max_loop"}:
         print_rank_0("local_hessian: Running max calibration for all quantizers...")
         max_start = int(resume.data.get("max_forward_step", 0)) if stage == "max_loop" else 0
-        if max_start > 0:
+        if max_start > 0 or extend_completed_checkpoint:
             unsupported = _seed_calibrator_from_quantizer_amax(model)
             if unsupported:
                 print_rank_0(
@@ -1303,6 +1378,8 @@ def local_hessian_calibrate(
         )
         resume.save(model, "after_max")
         stage = "after_max"
+        if extend_completed_checkpoint:
+            stage = "hessian_cache_loop"
 
     # Setup helpers for all quantized linear modules
     name_to_module = dict(model.named_modules())
@@ -1317,6 +1394,21 @@ def local_hessian_calibrate(
                 module.hessian_helper.setup()
                 if module.hessian_helper.is_enabled:
                     weight_quantizers_info.append((name, module))
+
+        if stage in {"after_hessian_cache", "weight_loop"} and weight_quantizers_info:
+            aux_state = resume.load_aux_state()
+            restored_count = _restore_hessian_cache_state(aux_state) if isinstance(aux_state, dict) else 0
+            if restored_count != len(weight_quantizers_info):
+                print_rank_0(
+                    "local_hessian: resume checkpoint is missing complete hessian cache state "
+                    f"({restored_count}/{len(weight_quantizers_info)} restored). "
+                    "Rebuilding hessian cache from after_max."
+                )
+                stage = "after_max"
+            else:
+                print_rank_0(
+                    f"local_hessian: restored final hessian cache for {restored_count} modules."
+                )
 
         if stage in {"after_max", "hessian_cache_loop"}:
             if len(weight_quantizers_info) == 0:
@@ -1343,7 +1435,21 @@ def local_hessian_calibrate(
                 )
                 cache_last_step = max(cache_start_step, 0)
 
-                if cache_start_step > 0:
+                if extend_completed_checkpoint:
+                    aux_state = resume.load_aux_state()
+                    restored_count = _restore_hessian_cache_state(aux_state) if isinstance(aux_state, dict) else 0
+                    if restored_count != len(weight_quantizers_info):
+                        raise RuntimeError(
+                            "local_hessian cannot extend a completed checkpoint without complete "
+                            f"hessian cache state ({restored_count}/{len(weight_quantizers_info)} restored). "
+                            "Run the original calibration with --resume_keep_checkpoint using the new "
+                            "checkpoint format, or start from scratch."
+                        )
+                    print_rank_0(
+                        f"local_hessian: restored base hessian cache for {restored_count} modules "
+                        "before appending new calibration data."
+                    )
+                elif cache_start_step > 0:
                     aux_state = resume.load_aux_state()
                     if aux_state is None:
                         print_rank_0(
@@ -1353,7 +1459,7 @@ def local_hessian_calibrate(
                         cache_start_step = 0
                     else:
                         restored_count = _restore_hessian_cache_state(aux_state)
-                        if restored_count == 0:
+                        if restored_count != len(weight_quantizers_info):
                             cached_entries = 0
                             if isinstance(aux_state, dict):
                                 helpers_state = aux_state.get("hessian_helpers", {})
@@ -1361,11 +1467,20 @@ def local_hessian_calibrate(
                                     cached_entries = len(helpers_state)
                             print_rank_0(
                                 "local_hessian: failed to restore cached hessian accumulators "
-                                f"(cached_entries={cached_entries}, helpers={len(weight_quantizers_info)}); "
-                            "restarting cache pass from step 0."
+                                f"(restored={restored_count}, cached_entries={cached_entries}, "
+                                f"helpers={len(weight_quantizers_info)}); restarting cache pass from step 0."
                             )
+                            _reset_hessian_helpers()
                             cache_start_step = 0
                         else:
+                            aux_cache_step = int(aux_state.get("hessian_cache_step", cache_start_step))
+                            if aux_cache_step != cache_start_step:
+                                print_rank_0(
+                                    "local_hessian: using hessian cache step from aux state "
+                                    f"({aux_cache_step}) instead of JSON state ({cache_start_step})."
+                                )
+                                cache_start_step = aux_cache_step
+                                cache_last_step = aux_cache_step
                             print_rank_0(
                                 f"local_hessian: restored hessian cache for {restored_count} modules "
                                 f"at step {cache_start_step}."
@@ -1373,12 +1488,7 @@ def local_hessian_calibrate(
 
                 cache_save_interval = None
                 if resume.enabled:
-                    total_batches = getattr(forward_loop, "num_batches", None)
-                    if isinstance(total_batches, int) and total_batches > 0:
-                        # Limit hessian-cache checkpoint IO overhead.
-                        cache_save_interval = max(resume.save_interval, max(total_batches // 16, 1))
-                    else:
-                        cache_save_interval = max(resume.save_interval, 128)
+                    cache_save_interval = resume.hessian_save_interval
 
                 def _on_cache_step(step: int) -> None:
                     nonlocal cache_last_step
@@ -1395,7 +1505,10 @@ def local_hessian_calibrate(
                         model,
                         "hessian_cache_loop",
                         hessian_cache_step=step,
-                        aux_state={"hessian_helpers": helper_state},
+                        aux_state={
+                            "hessian_cache_step": step,
+                            "hessian_helpers": helper_state,
+                        },
                     )
 
                 supports_cache_resume = _run_forward_loop_with_progress(
@@ -1419,11 +1532,19 @@ def local_hessian_calibrate(
                     )
 
                 if resume.enabled:
+                    helper_state = _collect_hessian_cache_state()
                     resume.save(
                         model,
                         "after_hessian_cache",
                         hessian_cache_step=cache_last_step,
-                        clear_aux_state=True,
+                        aux_state=(
+                            {
+                                "hessian_cache_step": cache_last_step,
+                                "hessian_helpers": helper_state,
+                            }
+                            if helper_state
+                            else None
+                        ),
                     )
                 stage = "after_hessian_cache"
                 LocalHessianHelper.cache_mode = False
@@ -1555,14 +1676,13 @@ def local_hessian_calibrate(
                 cal.reset()
 
             if resume.enabled and (
-                (idx + 1) % resume.save_interval == 0 or (idx + 1) == len(weight_list)
+                (idx + 1) % resume.weight_save_interval == 0 or (idx + 1) == len(weight_list)
             ):
                 resume.save(
                     model,
                     "weight_loop",
                     next_weight_index=idx + 1,
                     weight_keys=weight_keys,
-                    clear_aux_state=True,
                 )
 
         if torch.cuda.is_available():
@@ -1580,7 +1700,6 @@ def local_hessian_calibrate(
             "done",
             next_weight_index=len(weight_list),
             weight_keys=weight_keys,
-            clear_aux_state=True,
         )
         resume.finalize(success=True)
     finally:

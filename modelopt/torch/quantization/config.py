@@ -1311,14 +1311,31 @@ class QuantizeAlgorithmConfig(ModeloptBaseConfig):
             "ModelOpt state and resume progress (for example, after interruption)."
         ),
     )
-    resume_save_interval: int = ModeloptField(
-        default=1,
+    resume_max_save_interval: int = ModeloptField(
+        default=4,
         ge=1,
-        title="Resume checkpoint save interval.",
+        title="Resume checkpoint save interval for max calibration.",
         description=(
-            "How often to save calibration resume checkpoints in supported algorithms. "
-            "For weight-loop algorithms (e.g. MSE/local_hessian), this is measured in "
-            "processed weight-quantizers."
+            "How often to save calibration resume checkpoints during max-calibration "
+            "forward loops, measured in processed calibration batches."
+        ),
+    )
+    resume_hessian_save_interval: int = ModeloptField(
+        default=4,
+        ge=1,
+        title="Resume checkpoint save interval for local Hessian cache.",
+        description=(
+            "How often to save local Hessian cache checkpoints, measured in processed "
+            "calibration batches."
+        ),
+    )
+    resume_weight_save_interval: int = ModeloptField(
+        default=256,
+        ge=1,
+        title="Resume checkpoint save interval for weight search.",
+        description=(
+            "How often to save calibration resume checkpoints during weight-loop scale "
+            "search, measured in processed weight quantizers."
         ),
     )
     resume_keep_checkpoint: bool = ModeloptField(
@@ -1327,6 +1344,15 @@ class QuantizeAlgorithmConfig(ModeloptBaseConfig):
         description=(
             "If True, keep checkpoint artifacts after calibration finishes successfully. "
             "If False, artifacts are removed on success."
+        ),
+    )
+    resume_extend_calib: bool = ModeloptField(
+        default=False,
+        title="Extend a completed resume checkpoint with more calibration data.",
+        description=(
+            "If True and the resume checkpoint is already completed, reuse its saved "
+            "calibration state and treat the current calibration dataset as additional "
+            "data to append instead of returning immediately."
         ),
     )
 
