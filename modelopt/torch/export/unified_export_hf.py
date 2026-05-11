@@ -128,15 +128,16 @@ def _excluded_pattern_matches_module(pattern: str, module_name: str) -> bool:
     )
 
 
-def _drop_excluded_lm_head_compressed_residue(
+def _drop_excluded_dense_compressed_residue(
     state_dict: dict[str, Any], quant_config: dict[str, Any]
 ) -> dict[str, Any]:
-    """Drop stale compressed buffers for excluded dense lm_head modules.
+    """Drop stale compressed buffers for excluded dense modules.
 
-    Kimi checkpoints keep lm_head as a real BF16 weight while many MoE experts are stored
-    in compressed form. If lm_head is represented by a CompressedLinear wrapper during
-    export, stale compressed buffers can leak into the state dict alongside the real
-    ``lm_head.weight``. Serving should see the excluded lm_head as a dense BF16 module.
+    Kimi checkpoints keep vision tower, mm_projector, lm_head, and several text modules
+    as real BF16 weights while many MoE experts are stored in compressed form. If an
+    excluded dense module is represented by a CompressedLinear wrapper during export,
+    stale compressed buffers can leak into the state dict alongside the real
+    ``*.weight``. Serving should see those excluded modules as dense BF16 modules.
     """
     exclude_modules = quant_config.get("quantization", {}).get("exclude_modules", [])
     if not exclude_modules:
@@ -155,8 +156,6 @@ def _drop_excluded_lm_head_compressed_residue(
         if not weight_key.endswith(".weight"):
             continue
         module_name = weight_key.removesuffix(".weight")
-        if not module_name.endswith("lm_head"):
-            continue
         if not any(_excluded_pattern_matches_module(pattern, module_name) for pattern in exclude_modules):
             continue
 
@@ -610,11 +609,23 @@ def _export_quantized_weight(
             weight, is_bmm_expert_weight=is_bmm_expert_weight
         )
 
-        weight_scale = NVFP4QTensor.get_weights_scaling_factor(
-            weight,
-            block_size=block_size,
-            weights_scaling_factor_2=weight_scale_2,
-        )[0]
+        if isinstance(weight_quantizer, NVFP4StaticQuantizer):
+            # Static NVFP4 quantizers may contain local-Hessian/MSE searched amax
+            # values that intentionally clip raw-weight outliers. Recomputing the
+            # block scales from raw weights here would discard that clipping and can
+            # overflow the FP8 block-scale range.
+            if weight_scale is None:
+                weight_scale = NVFP4QTensor.get_weights_scaling_factor_from_quantizer(
+                    weight_quantizer,
+                    weight,
+                    weight_scale_2,
+                )[0]
+        else:
+            weight_scale = NVFP4QTensor.get_weights_scaling_factor(
+                weight,
+                block_size=block_size,
+                weights_scaling_factor_2=weight_scale_2,
+            )[0]
 
         quantized_weight = to_quantized_weight(
             weight.to(dtype),
@@ -892,7 +903,7 @@ def _export_transformers_checkpoint(
     quantized_state_dict = postprocess_state_dict(
         quantized_state_dict, kv_cache_max_bound, kv_cache_format, is_modelopt_qlora
     )
-    quantized_state_dict = _drop_excluded_lm_head_compressed_residue(
+    quantized_state_dict = _drop_excluded_dense_compressed_residue(
         quantized_state_dict, quant_config
     )
 

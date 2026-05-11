@@ -494,6 +494,22 @@ def _unpack_compressed_linear_weights(model, ckpt_path=None):
                 if ".mlp.experts." not in key or "weight_shape" in key:
                     checkpoint_weights[key] = f.get_tensor(key)
 
+    compressed_residue_attrs = (
+        "weight_packed",
+        "weight_scale",
+        "weight_shape",
+        "weight_scale_2",
+        "weight_zero_point",
+    )
+
+    def _drop_tensor_attr(module, attr_name):
+        module._parameters.pop(attr_name, None)
+        module._buffers.pop(attr_name, None)
+        module.__dict__.pop(attr_name, None)
+
+    restored_dense = 0
+    fixed_compressed = 0
+
     # Hybrid restoration
     for name, module in model.named_modules():
         if not isinstance(module, CompressedLinear):
@@ -508,10 +524,13 @@ def _unpack_compressed_linear_weights(model, ckpt_path=None):
                 module._parameters.pop("weight", None)
                 module._buffers.pop("weight", None)
                 module.__dict__.pop("weight", None)
+                for attr_name in compressed_residue_attrs:
+                    _drop_tensor_attr(module, attr_name)
                 param = torch.nn.Parameter(w, requires_grad=False)
                 module._parameters["weight"] = param
                 module.__dict__["weight"] = param
                 module.quantization_status = QuantizationStatus.FROZEN
+                restored_dense += 1
                 logger.debug("Restored BF16 layer: %s", name)
 
             # CASE B: Expert (stay compressed, fix metadata)
@@ -529,6 +548,7 @@ def _unpack_compressed_linear_weights(model, ckpt_path=None):
                 module.__dict__.pop("weight_shape", None)
                 module._parameters["weight_shape"] = shape_param
                 module.__dict__["weight_shape"] = shape_param
+                fixed_compressed += 1
 
     # Ensure compressed experts do not carry a stale weight attribute
     for name, module in model.named_modules():
@@ -539,6 +559,13 @@ def _unpack_compressed_linear_weights(model, ckpt_path=None):
         module._parameters.pop("weight", None)
         module._buffers.pop("weight", None)
         module.__dict__.pop("weight", None)
+
+    if restored_dense or fixed_compressed:
+        print(
+            "Kimi compressed checkpoint fixup: "
+            f"restored {restored_dense} dense CompressedLinear weights and "
+            f"fixed {fixed_compressed} compressed metadata entries."
+        )
 
 
 def get_model(

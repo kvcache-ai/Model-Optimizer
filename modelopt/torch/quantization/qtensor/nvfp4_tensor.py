@@ -58,6 +58,35 @@ class NVFP4QTensor(BaseQuantizedTensor):
         return hasattr(weight_quantizer, "global_amax") and weight_quantizer.global_amax is not None
 
     @classmethod
+    def _safe_global_amax(cls, global_amax: torch.Tensor) -> torch.Tensor:
+        """Return a finite positive global amax for two-level NVFP4 scaling."""
+        global_amax = global_amax.float()
+        if not torch.all(torch.isfinite(global_amax)):
+            raise ValueError(f"NVFP4 global_amax contains non-finite values: {global_amax}")
+        return torch.where(global_amax > 0, global_amax, torch.ones_like(global_amax))
+
+    @classmethod
+    def _sanitize_fp8_block_scale(cls, scale: torch.Tensor) -> torch.Tensor:
+        """Clamp FP8-domain block scales before casting to float8_e4m3fn.
+
+        The input is the value that will be stored as FP8, not the final physical
+        scale. Zero and non-finite values would later cause bad packed weights, so
+        map them to a conservative finite value.
+        """
+        scale = torch.nan_to_num(scale.float(), nan=1.0, posinf=448.0, neginf=1.0)
+        scale = torch.where(scale > 0, scale, torch.ones_like(scale))
+        scale = scale.clamp(max=448.0)
+
+        scale_fp8 = scale.to(torch.float8_e4m3fn)
+        scale_fp8_float = scale_fp8.float()
+        bad_scale = (~torch.isfinite(scale_fp8_float)) | (scale_fp8_float <= 0)
+        if torch.any(bad_scale):
+            scale = torch.where(bad_scale, torch.ones_like(scale), scale)
+            scale_fp8 = scale.to(torch.float8_e4m3fn)
+
+        return scale_fp8
+
+    @classmethod
     def get_weights_scaling_factor_2_from_quantizer(cls, weight_quantizer):
         """Returns per tensor weight scaling factor from the weight_quantizer.
 
@@ -71,7 +100,7 @@ class NVFP4QTensor(BaseQuantizedTensor):
             The global scaling factor as a float tensor.
         """
         if cls._is_static_quantizer(weight_quantizer):
-            return weight_quantizer.global_amax.float() / (6.0 * 448.0)
+            return cls._safe_global_amax(weight_quantizer.global_amax) / (6.0 * 448.0)
         else:
             assert hasattr(weight_quantizer, "_amax"), (
                 "Weight quantizer does not have attribute amax"
@@ -109,13 +138,15 @@ class NVFP4QTensor(BaseQuantizedTensor):
 
         if cls._is_static_quantizer(weight_quantizer):
             # Static path: use pre-computed per-block amax values from quantizer
-            global_amax = weight_quantizer.global_amax.float()
-            per_block_amax = weight_quantizer._amax.float()
+            global_amax = cls._safe_global_amax(weight_quantizer.global_amax).to(weight.device)
+            per_block_amax = weight_quantizer._amax.float().to(weight.device)
+            if not torch.all(torch.isfinite(per_block_amax)):
+                raise ValueError("NVFP4 per-block amax contains non-finite values.")
+            per_block_amax = per_block_amax.clamp(min=0.0)
 
-            # Compute scales in float
-            per_block_scale_max = global_amax / 6.0
-            per_block_scale = per_block_amax / 6.0
-            per_block_scale[per_block_scale == 0] = 1.0
+            # Compute FP8-domain scales from local-Hessian/static amax. Do not recompute
+            # amax from raw weights here; the static amax may intentionally clip outliers.
+            per_block_scale = 448.0 * per_block_amax / global_amax
 
             # Reshape per_block_scale to match weight's block structure
             num_blocks_per_row = weight.shape[-1] // block_size
@@ -124,9 +155,7 @@ class NVFP4QTensor(BaseQuantizedTensor):
 
             # Quantize scales to FP8
             if not keep_high_precision:
-                per_block_scale = (per_block_scale * 448.0 / per_block_scale_max).to(
-                    torch.float8_e4m3fn
-                )
+                per_block_scale = cls._sanitize_fp8_block_scale(per_block_scale)
             return per_block_scale, weights_scaling_factor_2
         else:
             # Dynamic path: compute from weight tensor
@@ -173,7 +202,7 @@ class NVFP4QTensor(BaseQuantizedTensor):
     @classmethod
     def get_weights_scaling_factor_2(cls, input: torch.Tensor):
         """Returns per tensor weight scaling factor."""
-        return reduce_amax(input).float() / (6.0 * 448.0)
+        return cls._safe_global_amax(reduce_amax(input)) / (6.0 * 448.0)
 
     @classmethod
     def get_activation_scaling_factor(cls, quantizer):
