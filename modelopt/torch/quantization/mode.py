@@ -17,6 +17,8 @@
 
 from abc import abstractmethod
 from collections.abc import Callable
+import inspect
+import warnings
 
 from modelopt.torch.opt.config import ModeloptBaseConfig
 from modelopt.torch.opt.conversion import ModelLikeModule
@@ -225,6 +227,12 @@ def wrapped_calib_func(
     method = kwargs.pop("method")
     layerwise = kwargs.pop("layerwise", False)
     checkpoint_dir = kwargs.pop("layerwise_checkpoint_dir", None)
+    resume_checkpoint_dir = kwargs.pop("resume_checkpoint_dir", None)
+    resume_max_save_interval = kwargs.pop("resume_max_save_interval", 4)
+    resume_hessian_save_interval = kwargs.pop("resume_hessian_save_interval", 4)
+    resume_weight_save_interval = kwargs.pop("resume_weight_save_interval", 256)
+    resume_keep_checkpoint = kwargs.pop("resume_keep_checkpoint", False)
+    resume_extend_calib = kwargs.pop("resume_extend_calib", False)
     if method is not None and "awq" in method:
         # For backward compatibility
         kwargs["algorithm"] = method
@@ -239,6 +247,33 @@ def wrapped_calib_func(
                 module._moe_calib_experts_ratio = moe_calib_experts_ratio
 
     if func is not None:
+        if layerwise and resume_checkpoint_dir is not None:
+            warnings.warn(
+                "Use layerwise_checkpoint_dir for layerwise resume."
+            )
+            resume_checkpoint_dir = None
+
+        supports_resume = "resume_checkpoint_dir" in inspect.signature(func).parameters
+        supports_resume_extend = "resume_extend_calib" in inspect.signature(func).parameters
+        if resume_checkpoint_dir is not None and supports_resume:
+            kwargs["resume_checkpoint_dir"] = resume_checkpoint_dir
+            kwargs["resume_max_save_interval"] = resume_max_save_interval
+            kwargs["resume_hessian_save_interval"] = resume_hessian_save_interval
+            kwargs["resume_weight_save_interval"] = resume_weight_save_interval
+            kwargs["resume_keep_checkpoint"] = resume_keep_checkpoint
+            if resume_extend_calib and supports_resume_extend:
+                kwargs["resume_extend_calib"] = resume_extend_calib
+            elif resume_extend_calib and not supports_resume_extend:
+                warnings.warn(
+                    f"Calibration algorithm '{method}' does not support extending completed "
+                    "resume checkpoints. Ignoring resume_extend_calib."
+                )
+        elif resume_checkpoint_dir is not None and not supports_resume:
+            warnings.warn(
+                f"Calibration algorithm '{method}' does not support strict resume yet. "
+                "Ignoring resume_checkpoint_dir."
+            )
+
         if layerwise:
             # All currently implemented PTQ algorithms support layerwise calibration;
             # future algorithms that need full-model context must add a guard here.
