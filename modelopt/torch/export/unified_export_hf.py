@@ -491,6 +491,19 @@ def _export_quantized_weight(
     if quantization_format == QUANTIZATION_NONE:
         return
 
+    def _register_or_replace_buffer(name: str, tensor: torch.Tensor | None) -> None:
+        if tensor is None:
+            return
+        if name in sub_module._parameters:
+            del sub_module._parameters[name]
+        if name in sub_module._buffers:
+            del sub_module._buffers[name]
+        if name in sub_module._modules:
+            del sub_module._modules[name]
+        if name in sub_module.__dict__:
+            del sub_module.__dict__[name]
+        sub_module.register_buffer(name, tensor)
+
     block_size = get_weight_block_size(sub_module, weight_name)
     quantizer_attrs = quantizer_attr_names(weight_name)
     weight: nn.Parameter = getattr(sub_module, weight_name)
@@ -517,7 +530,7 @@ def _export_quantized_weight(
             # Per-channel amax
             weight_scaling_factor = torch.tensor(weight_quantizer.amax / weight_quantizer.maxbound)
 
-        sub_module.register_buffer(
+        _register_or_replace_buffer(
             quantizer_attrs.weight_scale,
             weight_scaling_factor,
         )
@@ -526,7 +539,7 @@ def _export_quantized_weight(
             assert input_quantizer is not None
             input_quantizer._amax = input_quantizer._amax.to(torch.float32)
 
-            sub_module.register_buffer(
+            _register_or_replace_buffer(
                 quantizer_attrs.input_scale,
                 get_activation_scaling_factor(
                     sub_module, input_quantizer_name=quantizer_attrs.input_quantizer
@@ -539,7 +552,7 @@ def _export_quantized_weight(
     else:
         # Register weight_scale and input_scale
         if quantization_format == QUANTIZATION_FP8_PB_REAL:
-            sub_module.register_buffer(
+            _register_or_replace_buffer(
                 quantizer_attrs.weight_scale,
                 weight_quantizer._scale.to(torch.float32),
             )
@@ -550,11 +563,11 @@ def _export_quantized_weight(
             e8m0_scale = MXFP8QTensor.get_weights_scaling_factor_from_quantizer(
                 weight, weight_quantizer
             )
-            sub_module.register_buffer(quantizer_attrs.weight_scale, e8m0_scale)
+            _register_or_replace_buffer(quantizer_attrs.weight_scale, e8m0_scale)
             if hasattr(weight_quantizer, "_scale") and weight_quantizer._scale is not None:
                 del weight_quantizer._scale
         else:
-            sub_module.register_buffer(
+            _register_or_replace_buffer(
                 quantizer_attrs.weight_scale, get_weight_scaling_factor(sub_module, weight_name)
             )
 
@@ -563,7 +576,7 @@ def _export_quantized_weight(
             and _is_enabled_quantizer(input_quantizer)
             and input_quantizer.amax is not None
         ):
-            sub_module.register_buffer(
+            _register_or_replace_buffer(
                 quantizer_attrs.input_scale,
                 get_activation_scaling_factor(
                     sub_module, input_quantizer_name=quantizer_attrs.input_quantizer
@@ -578,7 +591,7 @@ def _export_quantized_weight(
         QUANTIZATION_W4A8_NVFP4_FP8,
     ]:
         # Register weight_scale_2
-        sub_module.register_buffer(
+        _register_or_replace_buffer(
             quantizer_attrs.weight_scale_2,
             get_weight_scaling_factor_2(sub_module, weight_name).squeeze(),
         )
@@ -669,7 +682,7 @@ def _export_quantized_weight(
 
     # Register the corrected weight_scale as a buffer
     if weight_scale is not None:
-        sub_module.register_buffer(quantizer_attrs.weight_scale, weight_scale)
+        _register_or_replace_buffer(quantizer_attrs.weight_scale, weight_scale)
 
 
 def _process_quantized_modules(

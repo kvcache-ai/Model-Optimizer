@@ -24,7 +24,7 @@ from typing import Any, cast
 import torch.nn as nn
 
 from modelopt.torch.opt.conversion import ApplyModeError, ModelLikeModule, ModeloptStateManager
-from modelopt.torch.opt.dynamic import _DMRegistryCls
+from modelopt.torch.opt.dynamic import DynamicModule, _DMRegistryCls
 from modelopt.torch.opt.mode import ConvertReturnType, MetadataDict
 from modelopt.torch.utils import get_unwrapped_name
 
@@ -202,12 +202,76 @@ def replace_quant_module(model: nn.Module, version=None, registry=QuantModuleReg
     print(f"Inserted {replaced_modules} quantizers")
 
 
+def _is_compressed_tensors_linear(module: nn.Module) -> bool:
+    """Return whether ``module`` is an nn.Linear rewritten by compressed-tensors.
+
+    In transformers>=5.0 compressed-tensors may keep the Python class as
+    ``torch.nn.Linear`` while replacing ``weight`` with ``weight_packed`` /
+    ``weight_scale`` / ``weight_shape``.  Such modules must use the
+    compressed-linear quant wrapper; the regular nn.Linear wrapper requires a
+    real ``weight`` attribute and fails during dynamic attribute registration.
+    """
+
+    return (
+        isinstance(module, nn.Linear)
+        and not hasattr(module, "weight")
+        and hasattr(module, "weight_packed")
+        and hasattr(module, "weight_scale")
+        and hasattr(module, "weight_shape")
+        and hasattr(module, "quantization_status")
+    )
+
+
+_PACKED_COMPRESSED_LINEAR_DYNAMIC_CLASSES = {}
+
+
+def _convert_quant_module(module: nn.Module, registry=QuantModuleRegistry):
+    if _is_compressed_tensors_linear(module):
+        try:
+            from compressed_tensors.linear.compressed_linear import CompressedLinear
+        except ImportError:
+            CompressedLinear = None
+
+        if CompressedLinear is not None:
+            # compressed-tensors may rewrite packed experts into plain nn.Linear
+            # instances with weight_packed/weight_scale but no dense weight. Route
+            # those modules through the CompressedLinear wrapper instead of the
+            # regular QuantLinear wrapper.
+            compressed_dm_cls = getattr(registry, "_registry", {}).get(CompressedLinear)
+            if compressed_dm_cls is None:
+                try:
+                    from modelopt.torch.quantization.plugins.huggingface import (
+                        _QuantCompressedLinear,
+                    )
+                except ImportError:
+                    compressed_dm_cls = registry.get(CompressedLinear)
+                else:
+                    compressed_dm_cls = _QuantCompressedLinear
+            if compressed_dm_cls is not None:
+                key = (compressed_dm_cls, type(module))
+                quant_cls = _PACKED_COMPRESSED_LINEAR_DYNAMIC_CLASSES.get(key)
+                if quant_cls is None:
+                    quant_cls = type(
+                        f"Packed{compressed_dm_cls.__name__}{type(module).__name__}",
+                        (compressed_dm_cls, type(module)),
+                        {},
+                    )
+                    _PACKED_COMPRESSED_LINEAR_DYNAMIC_CLASSES[key] = quant_cls
+                return quant_cls.convert(module)
+
+    return registry.convert(module)
+
+
 def _replace_quant_module(model: nn.Module, version=None, registry=QuantModuleRegistry):
     """Helper function of replace_quant_module."""
     for name, child in model.named_children():
+        if isinstance(child, (DynamicModule, QuantModule)):
+            _replace_quant_module(child, version=version, registry=registry)
+            continue
+
         if type(child) in registry:
             # REPLACE on the parent (model), not on child
-            quantized = registry.convert(child)
+            quantized = _convert_quant_module(child, registry=registry)
             setattr(model, name, quantized)
 
         # now recurse into whichever module is now at `model.name`

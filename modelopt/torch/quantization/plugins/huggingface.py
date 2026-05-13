@@ -1108,10 +1108,29 @@ class _QuantCompressedLinear(QuantModule):
                 if not hasattr(self, "_logged_on_the_fly"):
                     logger.debug("On-the-fly decompression for %s", self.__class__.__name__)
                     self._logged_on_the_fly = True
-                weight_data = self.compressor.decompress_weight(
-                    compressed_data=compressed_data,
-                    quantization_args=quant_args,
-                )
+                if hasattr(self, "compressor"):
+                    weight_data = self.compressor.decompress_weight(
+                        compressed_data=compressed_data,
+                        quantization_args=quant_args,
+                    )
+                else:
+                    from compressed_tensors.config import CompressionFormat
+                    from compressed_tensors.compressors.pack_quantized import (
+                        PackedQuantizationCompressor,
+                    )
+
+                    scheme = getattr(self, "quantization_scheme", None)
+                    if (
+                        scheme is None
+                        or getattr(scheme, "format", None) != CompressionFormat.pack_quantized
+                    ):
+                        raise AttributeError(
+                            "Packed compressed linear has no compressor and no "
+                            "pack-quantized quantization_scheme."
+                        )
+                    weight_data = PackedQuantizationCompressor.decompress(
+                        compressed_data, scheme
+                    )["weight"]
             else:
                 weight_data = self.weight_packed
         else:
@@ -1289,7 +1308,10 @@ except ImportError:
 try:
     from compressed_tensors.linear.compressed_linear import CompressedLinear
 
-    if CompressedLinear not in QuantModuleRegistry:
+    # ``CompressedLinear`` subclasses ``nn.Linear`` and may share its forward
+    # method, so ``CompressedLinear in QuantModuleRegistry`` can be true because
+    # the generic Linear registration matches first. Check exact registration.
+    if getattr(QuantModuleRegistry, "_registry", {}).get(CompressedLinear) is None:
         QuantModuleRegistry.register({CompressedLinear: "hf.CompressedLinear"})(
             _QuantCompressedLinear
         )
