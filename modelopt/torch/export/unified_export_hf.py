@@ -29,6 +29,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from safetensors import safe_open
 from safetensors.torch import save_file
 
 try:
@@ -124,8 +125,115 @@ def _excluded_pattern_matches_module(pattern: str, module_name: str) -> bool:
     return (
         fnmatch.fnmatch(module_name, pattern)
         or fnmatch.fnmatch(f"{module_name}.", pattern)
+        or fnmatch.fnmatch(module_name, f"*.{pattern}")
         or (pattern == "lm_head" and module_name.endswith(".lm_head"))
     )
+
+
+def _excluded_pattern_matches_state_key(pattern: str, key: str) -> bool:
+    """Return whether an HF quant exclude pattern matches a state-dict key."""
+    if _excluded_pattern_matches_module(pattern, key):
+        return True
+
+    parts = key.split(".")
+    for idx in range(len(parts), 0, -1):
+        if _excluded_pattern_matches_module(pattern, ".".join(parts[:idx])):
+            return True
+    return False
+
+
+def _load_safetensors_key_to_path(checkpoint_path: str | Path) -> dict[str, Path]:
+    """Return a map from tensor key to safetensors shard path."""
+    checkpoint_path = Path(checkpoint_path)
+    if checkpoint_path.is_file():
+        if checkpoint_path.suffix != ".safetensors":
+            return {}
+        with safe_open(str(checkpoint_path), framework="pt", device="cpu") as f:
+            return {key: checkpoint_path for key in f.keys()}
+
+    if not checkpoint_path.is_dir():
+        return {}
+
+    index_path = checkpoint_path / "model.safetensors.index.json"
+    if index_path.is_file():
+        with open(index_path) as f:
+            weight_map = json.load(f).get("weight_map", {})
+        return {key: checkpoint_path / shard for key, shard in weight_map.items()}
+
+    key_to_path: dict[str, Path] = {}
+    for shard_path in sorted(checkpoint_path.glob("*.safetensors")):
+        with safe_open(str(shard_path), framework="pt", device="cpu") as f:
+            for key in f.keys():
+                key_to_path[key] = shard_path
+    return key_to_path
+
+
+def _restore_excluded_source_tensors_from_checkpoint(
+    state_dict: dict[str, Any],
+    quant_config: dict[str, Any],
+    source_checkpoint_path: str | Path | None,
+) -> dict[str, Any]:
+    """Overlay excluded-module tensors from the source checkpoint.
+
+    Quantized exports may load non-quantized tensors in the model default dtype
+    (for example BF16), while the source checkpoint can intentionally store some
+    router parameters or compressed metadata in another dtype. Excluded modules
+    are not part of the ModelOpt quantization result, so preserve their original
+    checkpoint representation exactly.
+    """
+    if source_checkpoint_path is None:
+        return state_dict
+
+    exclude_modules = quant_config.get("quantization", {}).get("exclude_modules", [])
+    if not exclude_modules:
+        return state_dict
+
+    key_to_path = _load_safetensors_key_to_path(source_checkpoint_path)
+    if not key_to_path:
+        warnings.warn(
+            f"Could not restore excluded tensors from source checkpoint {source_checkpoint_path}: "
+            "no safetensors weight map found."
+        )
+        return state_dict
+
+    keys_by_path: dict[Path, list[str]] = defaultdict(list)
+    for key, path in key_to_path.items():
+        if any(_excluded_pattern_matches_state_key(pattern, key) for pattern in exclude_modules):
+            keys_by_path[path].append(key)
+
+    if not keys_by_path:
+        return state_dict
+
+    restored_state_dict = dict(state_dict)
+    restored = 0
+    added = 0
+    dtype_restored = 0
+
+    for shard_path, keys in keys_by_path.items():
+        with safe_open(str(shard_path), framework="pt", device="cpu") as f:
+            shard_keys = set(f.keys())
+            for key in keys:
+                if key not in shard_keys:
+                    continue
+                source_tensor = f.get_tensor(key)
+                existing_tensor = restored_state_dict.get(key)
+                if existing_tensor is None:
+                    added += 1
+                elif (
+                    isinstance(existing_tensor, torch.Tensor)
+                    and existing_tensor.dtype != source_tensor.dtype
+                ):
+                    dtype_restored += 1
+                restored_state_dict[key] = source_tensor
+                restored += 1
+
+    if restored:
+        print(
+            "Restored excluded tensors from source checkpoint: "
+            f"{restored} tensors ({added} added, {dtype_restored} dtype-restored)."
+        )
+
+    return restored_state_dict
 
 
 def _drop_excluded_dense_compressed_residue(
@@ -788,6 +896,7 @@ def _export_transformers_checkpoint(
         )
 
     accelerator = kwargs.get("accelerator")
+    source_checkpoint_path = kwargs.get("source_checkpoint_path")
 
     # Handle input quantizers of experts that are not calibrated
     for _, sub_module in model.named_modules():
@@ -884,7 +993,7 @@ def _export_transformers_checkpoint(
                 exclude_modules.append(pattern)
                 print(f"Adding MTP layer to quantization_config ignore: {pattern}")
 
-    # Safety net: sync any gate/up weight quantizer amaxes that
+    # Safety net: sync any gate/up shared scale source that
     # requantize_resmooth_fused_llm_layers did not reach (e.g. experts not
     # activated during the dummy forward, or non-standard expert naming).
     synced = sync_moe_gate_up_amax(model)
@@ -893,7 +1002,7 @@ def _export_transformers_checkpoint(
             f"Found {synced} MoE expert gate/up projection pair(s) with mismatched "
             f"weight_scale_2 after requantize_resmooth_fused_llm_layers. "
             f"This typically means the dummy forward did not activate these experts. "
-            f"Taking element-wise max of amaxes for serving-engine fusion."
+            f"Syncing the shared NVFP4 global_amax/amax for serving-engine fusion."
         )
 
     # Process all quantized modules and export weights
@@ -915,6 +1024,9 @@ def _export_transformers_checkpoint(
     kv_cache_format = quant_config["quantization"]["kv_cache_quant_algo"]
     quantized_state_dict = postprocess_state_dict(
         quantized_state_dict, kv_cache_max_bound, kv_cache_format, is_modelopt_qlora
+    )
+    quantized_state_dict = _restore_excluded_source_tensors_from_checkpoint(
+        quantized_state_dict, quant_config, source_checkpoint_path
     )
     quantized_state_dict = _drop_excluded_dense_compressed_residue(
         quantized_state_dict, quant_config
@@ -1260,9 +1372,12 @@ def export_hf_checkpoint(
             from this base safetensors file to produce a single-file checkpoint
             compatible with ComfyUI. Value should be the path to a full base model
             ``.safetensors`` file (e.g. ``"path/to/ltx-2-19b-dev.safetensors"``).
-            Only used for diffusion model exports.
+            Only used for diffusion model exports. Also supported:
+            source_checkpoint_path (str, optional), used by transformers exports to restore
+            excluded-module tensors from the original checkpoint before saving.
     """
     merged_base_safetensor_path: str | None = kwargs.get("merged_base_safetensor_path")
+    source_checkpoint_path: str | Path | None = kwargs.get("source_checkpoint_path")
     export_dir = Path(export_dir)
     export_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1276,7 +1391,9 @@ def export_hf_checkpoint(
         return
 
     try:
-        post_state_dict, hf_quant_config = _export_transformers_checkpoint(model, dtype)
+        post_state_dict, hf_quant_config = _export_transformers_checkpoint(
+            model, dtype, source_checkpoint_path=source_checkpoint_path
+        )
 
         if hf_quant_config is not None:
             # Save hf_quant_config.json for backward compatibility

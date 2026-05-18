@@ -18,6 +18,7 @@
 import fnmatch
 import inspect
 import os
+import time
 import warnings
 from collections.abc import Callable, Iterable
 from typing import Any
@@ -34,7 +35,7 @@ from modelopt.torch.quantization.conversion import (
     set_quantizer_attributes_partial,
     set_quantizer_by_cfg,
 )
-from modelopt.torch.utils import atomic_print
+from modelopt.torch.utils import atomic_print, format_duration, record_timing_event
 
 from .algorithms import AutoQuantizeGradientSearcher, AutoQuantizeKLDivSearcher, QuantRecipe
 from .algorithms import get_auto_quantize_config as _get_auto_quantize_config
@@ -55,7 +56,6 @@ __all__ = [
     "print_quant_summary",
     "quantize",
 ]
-
 
 # TODO: Descriptors for the supported algorithms
 def calibrate(
@@ -239,12 +239,22 @@ def quantize(
     Returns: A pytorch model which has been quantized and calibrated.
     """
     if not is_quantized(model):
+        convert_start_time = time.perf_counter()
         model = apply_mode(model, mode=[("quantize", dict(config))], registry=QuantizeModeRegistry)
+        convert_duration = time.perf_counter() - convert_start_time
+        print(f"quantize timing: convert_compress_model={format_duration(convert_duration)}")
+        record_timing_event("quantize.convert_compress_model", convert_duration)
     else:
         # Already quantized, so lets apply the quant_cfg from the config
         quant_cfg = QuantizeConfig(**dict(config)).quant_cfg
         set_quantizer_by_cfg(model, quant_cfg)
-    return calibrate(model, config.get("algorithm"), forward_loop=forward_loop)
+
+    calibrate_start_time = time.perf_counter()
+    model = calibrate(model, config.get("algorithm"), forward_loop=forward_loop)
+    calibrate_duration = time.perf_counter() - calibrate_start_time
+    print(f"quantize timing: calibrate_total={format_duration(calibrate_duration)}")
+    record_timing_event("quantize.calibrate_total", calibrate_duration)
+    return model
 
 
 # TODO: create a config interface for auto_quantize and expose setting

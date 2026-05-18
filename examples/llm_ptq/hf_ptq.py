@@ -15,6 +15,7 @@
 
 import argparse
 import copy
+import os
 import random
 import time
 import warnings
@@ -79,10 +80,36 @@ from modelopt.torch.utils.dataset_utils import (
 )
 from modelopt.torch.utils.image_processor import BaseImageProcessor, MllamaImageProcessor
 from modelopt.torch.utils.memory_monitor import launch_memory_monitor
+from modelopt.torch.utils.perf import format_duration, record_timing_event
 from modelopt.torch.utils.speech_dataset_utils import get_speech_dataset_dataloader
 from modelopt.torch.utils.vlm_dataset_utils import get_vlm_dataset_dataloader
 
 RAND_SEED = 1234
+
+
+def _setup_timing_log(args: argparse.Namespace) -> str | None:
+    if os.environ.get("MODELOPT_TIMING_LOG_PATH"):
+        return os.environ["MODELOPT_TIMING_LOG_PATH"]
+
+    base_dir = args.resume_checkpoint_dir or args.export_path
+    if not base_dir:
+        return None
+
+    timing_dir = Path(base_dir)
+    timing_dir.mkdir(parents=True, exist_ok=True)
+    timing_log_path = timing_dir / "quant_timing.jsonl"
+    os.environ["MODELOPT_TIMING_LOG_PATH"] = str(timing_log_path)
+    os.environ.setdefault(
+        "MODELOPT_TIMING_RUN_ID", f"{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
+    )
+    record_timing_event(
+        "hf_ptq.timing_log_initialized",
+        timing_log_path=str(timing_log_path),
+        qformat=args.qformat,
+        export_path=args.export_path,
+        resume_checkpoint_dir=args.resume_checkpoint_dir,
+    )
+    return str(timing_log_path)
 
 
 def _set_kv_cache_constant_amax(quant_cfg: list) -> None:
@@ -700,7 +727,18 @@ def mono_quantize(
                 language_model, quant_cfg["algorithm"], forward_loop=calibrate_loop
             )
         else:
+            quantize_start_time = time.perf_counter()
             language_model = mtq.quantize(language_model, quant_cfg, forward_loop=calibrate_loop)
+            quantize_duration = time.perf_counter() - quantize_start_time
+            print(
+                "hf_ptq timing: mtq_quantize_total="
+                f"{format_duration(quantize_duration)}"
+            )
+            record_timing_event(
+                "hf_ptq.mtq_quantize_total",
+                quantize_duration,
+                qformat=args.qformat,
+            )
 
         # For VL models, update full_model to use the quantized language model
         if is_nemotron_vl_model:
@@ -767,7 +805,7 @@ def export_quantized(
             setattr(full_model.config, "text_config", full_model_config.text_config)
             setattr(full_model.config, "architectures", full_model_config.architectures)
 
-        start_time = time.time()
+        start_time = time.perf_counter()
         if (
             model_type in ["t5", "bart", "whisper"]
             or args.sparsity_fmt != "dense"
@@ -830,6 +868,7 @@ def export_quantized(
                     full_model,
                     export_dir=export_path,
                     extra_state_dict=mtp_state_dict,
+                    source_checkpoint_path=args.pyt_ckpt_path,
                 )
 
         # Restore default padding and export the tokenizer as well.
@@ -845,9 +884,17 @@ def export_quantized(
         # differ in format due to newer transformers versions).
         copy_custom_model_files(args.pyt_ckpt_path, export_path, args.trust_remote_code)
 
-        end_time = time.time()
+        end_time = time.perf_counter()
+        export_duration = end_time - start_time
         print(
-            f"Quantized model exported to: {export_path}. Total time used {end_time - start_time}s"
+            f"Quantized model exported to: {export_path}. "
+            f"Total time used {format_duration(export_duration)}"
+        )
+        record_timing_event(
+            "hf_ptq.export",
+            export_duration,
+            export_path=export_path,
+            qformat=args.qformat,
         )
 
 
@@ -1510,6 +1557,12 @@ def main(args: argparse.Namespace):
     # Force eager execution for all model types.
     torch.compiler.set_stance("force_eager")
 
+    timing_log_path = _setup_timing_log(args)
+    if timing_log_path is not None:
+        print(f"hf_ptq timing log: {timing_log_path}")
+
+    total_start_time = time.perf_counter()
+    load_start_time = time.perf_counter()
     (
         full_model,
         language_model,
@@ -1521,6 +1574,14 @@ def main(args: argparse.Namespace):
         default_pad_token,
         device,
     ) = load_model(args)
+    load_duration = time.perf_counter() - load_start_time
+    print(f"hf_ptq timing: load_model={format_duration(load_duration)}")
+    record_timing_event(
+        "hf_ptq.load_model",
+        load_duration,
+        model_path=args.pyt_ckpt_path,
+        qformat=args.qformat,
+    )
 
     if args.sparsity_fmt != "dense":
         # Sparse
@@ -1539,6 +1600,15 @@ def main(args: argparse.Namespace):
             default_pad_token,
             device,
         )
+    total_duration = time.perf_counter() - total_start_time
+    print(f"hf_ptq timing: total={format_duration(total_duration)}")
+    record_timing_event(
+        "hf_ptq.total",
+        total_duration,
+        model_path=args.pyt_ckpt_path,
+        export_path=args.export_path,
+        qformat=args.qformat,
+    )
 
 
 if __name__ == "__main__":

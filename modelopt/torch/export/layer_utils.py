@@ -1208,19 +1208,19 @@ _GATE_UP_PAIRS = [("gate_proj", "up_proj"), ("w1", "w3")]
 
 
 def sync_moe_gate_up_amax(model: nn.Module) -> int:
-    """Take element-wise max of gate and up weight quantizer amaxes per expert.
+    """Take max of gate and up weight quantizer scales per expert.
 
     Serving engines fuse gate_proj and up_proj into a single gate_up_proj and
-    require a single weight_scale_2. Since weight_scale_2 = amax / (6 * 448),
-    syncing amaxes before quantization ensures the per-block weight_scale values
-    are computed against a consistent global scale.
+    require a single weight_scale_2. For static NVFP4, weight_scale_2 comes from
+    global_amax, while per-block amax values hold the searched clipping result.
+    Keep per-block amax intact and sync only global_amax when it is available.
 
     Only affects standard MoE models with separate gate/up linear layers
     (e.g. Qwen MoE, DeepSeek). Models with already-fused gate_up_proj
     (e.g. Llama4, GptOss) are unaffected.
 
     Returns:
-        Number of expert gate/up pairs whose amaxes were synced.
+        Number of expert gate/up pairs whose scale source was synced.
     """
     synced = 0
     for _, sub_module in model.named_modules():
@@ -1238,6 +1238,25 @@ def sync_moe_gate_up_amax(model: nn.Module) -> int:
                 up_wq = getattr(up_linear, "weight_quantizer", None)
                 if gate_wq is None or up_wq is None:
                     break
+
+                gate_global_amax = getattr(gate_wq, "global_amax", None)
+                up_global_amax = getattr(up_wq, "global_amax", None)
+                if gate_global_amax is not None and up_global_amax is not None:
+                    if gate_global_amax.is_meta or up_global_amax.is_meta:
+                        warn(
+                            f"Skipping gate/up global amax sync for expert with meta tensors "
+                            f"(gate_global_amax.is_meta={gate_global_amax.is_meta}, "
+                            f"up_global_amax.is_meta={up_global_amax.is_meta})."
+                        )
+                        break
+                    up_global_for_gate = up_global_amax.to(gate_global_amax.device)
+                    if not torch.equal(gate_global_amax, up_global_for_gate):
+                        shared_global_amax = torch.max(gate_global_amax, up_global_for_gate)
+                        gate_wq.global_amax = shared_global_amax
+                        up_wq.global_amax = shared_global_amax.to(up_global_amax.device)
+                        synced += 1
+                    break
+
                 gate_amax = getattr(gate_wq, "amax", None)
                 up_amax = getattr(up_wq, "amax", None)
                 if gate_amax is None or up_amax is None:

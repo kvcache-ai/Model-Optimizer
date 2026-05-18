@@ -1077,8 +1077,9 @@ def postprocess_state_dict(
         "_amax",
         "_bias_value",
         "input_quantizer._pre_quant_scale",
-        "weight_shape",
     ]
+    # Do not add ``weight_shape`` here: compressed_tensors INT4 experts need it
+    # to reconstruct the dense shape from packed weights.
 
     # For modelopt-trained LoRA models, we need to remove the base_layer prefix from the keys for deployment
     if is_modelopt_qlora:

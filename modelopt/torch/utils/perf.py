@@ -15,8 +15,12 @@
 
 """Utility functions for performance measurement."""
 
+import json
+import os
 import time
 from contextlib import ContextDecorator
+from datetime import datetime
+from pathlib import Path
 
 import torch
 
@@ -27,8 +31,10 @@ __all__ = [
     "AccumulatingTimer",
     "Timer",
     "clear_cuda_cache",
+    "format_duration",
     "get_cuda_memory_stats",
     "get_used_gpu_mem_fraction",
+    "record_timing_event",
     "report_memory",
 ]
 
@@ -37,6 +43,50 @@ def clear_cuda_cache():
     """Clear the CUDA cache."""
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+def format_duration(seconds: float) -> str:
+    """Format a duration in seconds for human-readable logs."""
+    seconds = max(float(seconds), 0.0)
+    if seconds < 60:
+        return f"{seconds:.2f}s"
+    minutes, secs = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{int(minutes)}m{secs:05.2f}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{int(hours)}h{int(minutes):02d}m{secs:05.2f}s"
+
+
+def record_timing_event(event: str, seconds: float | None = None, **extra) -> None:
+    """Append one timing event to ``MODELOPT_TIMING_LOG_PATH`` as JSONL.
+
+    The log path is intentionally environment-driven so nested ModelOpt code can
+    persist timings without threading script-specific arguments through every API.
+    """
+
+    log_path = os.environ.get("MODELOPT_TIMING_LOG_PATH")
+    if not log_path:
+        return
+
+    payload = {
+        "event": event,
+        "time_unix": time.time(),
+        "time_local": datetime.now().isoformat(timespec="seconds"),
+        "pid": os.getpid(),
+        "run_id": os.environ.get("MODELOPT_TIMING_RUN_ID"),
+    }
+    if seconds is not None:
+        payload["seconds"] = float(seconds)
+        payload["duration"] = format_duration(seconds)
+    payload.update(extra)
+
+    path = Path(log_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=True, sort_keys=True)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
 
 
 def get_cuda_memory_stats(device=None):

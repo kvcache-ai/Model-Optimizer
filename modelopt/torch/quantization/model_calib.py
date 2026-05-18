@@ -37,7 +37,7 @@ from modelopt.torch.quantization.utils.layerwise_calib import (
     LayerActivationCollector,
     _CheckpointState,
 )
-from modelopt.torch.utils import get_unwrapped_name, print_rank_0
+from modelopt.torch.utils import format_duration, get_unwrapped_name, print_rank_0, record_timing_event
 from modelopt.torch.utils.distributed import DistributedProcessGroup, ParallelState
 from modelopt.torch.utils.network import bind_forward_method, unpatch_forward_method
 
@@ -75,6 +75,7 @@ CalibratorFactory: TypeAlias = Callable[
 ]
 
 _FP8_SWEEP_CALIBRATOR_REGISTRY: dict[str, CalibratorFactory] = {}
+_MOE_GATE_UP_PAIRS = (("gate_proj", "up_proj"), ("w1", "w3"))
 
 
 def _register_fp8_sweep_calibrator(backend: str, calibrator_factory: CalibratorFactory) -> None:
@@ -388,6 +389,87 @@ def _check_moe_calibration_complete(quantizer, parallel_state):
                 "MoE calibration incomplete: some experts received no tokens during calibration. "
                 "Increase --calib-size to ensure all experts see calibration data."
             )
+
+
+def _is_nvfp4_static_block_quantizer(weight_quantizer: TensorQuantizer) -> bool:
+    block_sizes = getattr(weight_quantizer, "_block_sizes", None)
+    return (
+        isinstance(weight_quantizer, TensorQuantizer)
+        and weight_quantizer.is_static_block_quant
+        and weight_quantizer._num_bits == (2, 1)
+        and block_sizes is not None
+        and block_sizes.get("scale_bits") == (4, 3)
+    )
+
+
+def _collect_moe_gate_up_shared_nvfp4_global_amax(
+    model: nn.Module,
+) -> tuple[dict[int, torch.Tensor], int]:
+    """Collect shared gate/up NVFP4 global amax values for fused MoE serving.
+
+    Gate and up projections are searched independently at the per-block level, but
+    serving engines often fuse them into one gate_up projection and require one
+    ``weight_scale_2``. For static NVFP4, ``weight_scale_2`` is derived from
+    ``global_amax``. This helper chooses a shared global value after max
+    calibration and before MSE/local-Hessian search.
+    """
+    shared_global_amax_by_quantizer_id: dict[int, torch.Tensor] = {}
+    synced = 0
+
+    for _, sub_module in model.named_modules():
+        experts = getattr(sub_module, "experts", None)
+        if experts is None or not hasattr(experts, "__iter__"):
+            continue
+
+        for expert in experts:
+            for gate_name, up_name in _MOE_GATE_UP_PAIRS:
+                gate_linear = getattr(expert, gate_name, None)
+                up_linear = getattr(expert, up_name, None)
+                if gate_linear is None or up_linear is None:
+                    continue
+
+                gate_wq = getattr(gate_linear, "weight_quantizer", None)
+                up_wq = getattr(up_linear, "weight_quantizer", None)
+                if not (
+                    _is_nvfp4_static_block_quantizer(gate_wq)
+                    and _is_nvfp4_static_block_quantizer(up_wq)
+                    and getattr(gate_wq, "is_enabled", False)
+                    and getattr(up_wq, "is_enabled", False)
+                ):
+                    break
+
+                gate_amax = getattr(gate_wq, "_amax", None)
+                up_amax = getattr(up_wq, "_amax", None)
+                if gate_amax is None or up_amax is None:
+                    break
+                if gate_amax.is_meta or up_amax.is_meta:
+                    break
+
+                gate_global = reduce_amax(gate_amax, axis=None).detach().float()
+                up_global = reduce_amax(up_amax, axis=None).detach().float()
+                up_global_for_gate = up_global.to(gate_global.device)
+                shared_global = torch.maximum(gate_global, up_global_for_gate)
+
+                shared_global_amax_by_quantizer_id[id(gate_wq)] = shared_global
+                shared_global_amax_by_quantizer_id[id(up_wq)] = shared_global.to(
+                    up_global.device
+                )
+                if not torch.equal(gate_global, up_global_for_gate):
+                    synced += 1
+                break
+
+    return shared_global_amax_by_quantizer_id, synced
+
+
+def _select_nvfp4_global_amax(
+    weight_quantizer: TensorQuantizer,
+    initial_amax: torch.Tensor | None,
+    shared_global_amax_by_quantizer_id: dict[int, torch.Tensor],
+) -> torch.Tensor | None:
+    shared_global_amax = shared_global_amax_by_quantizer_id.get(id(weight_quantizer))
+    if shared_global_amax is not None:
+        return shared_global_amax
+    return reduce_amax(initial_amax, axis=None) if initial_amax is not None else None
 
 
 def _snapshot_calibrator_amax_to_quantizers(model: nn.Module) -> None:
@@ -846,6 +928,15 @@ def mse_calibrate(
         resume.save(model, "after_missing_weight_amax")
         stage = "after_missing_weight_amax"
 
+    shared_global_amax_by_quantizer_id, synced_gate_up_pairs = (
+        _collect_moe_gate_up_shared_nvfp4_global_amax(model)
+    )
+    if synced_gate_up_pairs:
+        print_rank_0(
+            "MSE calibration: using shared NVFP4 global_amax for "
+            f"{synced_gate_up_pairs} gate/up expert pair(s)."
+        )
+
     rebuild_weight_calibrators = stage == "weight_loop"
     if stage in {
         "after_missing_weight_amax",
@@ -870,7 +961,11 @@ def mse_calibrate(
 
                     if is_nvfp4_static:
                         # Compute and set global_amax
-                        global_amax = reduce_amax(initial_amax, axis=None)
+                        global_amax = _select_nvfp4_global_amax(
+                            module,
+                            initial_amax,
+                            shared_global_amax_by_quantizer_id,
+                        )
                         # Convert to NVFP4StaticQuantizer in-place
                         NVFP4StaticQuantizer.from_tensor_quantizer(module, global_amax=global_amax)
 
@@ -1049,6 +1144,9 @@ def local_hessian_calibrate(
         warnings.warn("forward_loop must be provided for local_hessian; skipping local_hessian")
         return
 
+    total_start_time = time.perf_counter()
+    phase_durations: dict[str, float] = {}
+
     resume = _CalibrationResumeCheckpoint(
         method="local_hessian",
         model=model,
@@ -1167,20 +1265,20 @@ def local_hessian_calibrate(
         )
 
     def _is_nvfp4_static_quantizer(weight_quantizer: TensorQuantizer) -> bool:
-        block_sizes = getattr(weight_quantizer, "_block_sizes", None)
-        return (
-            weight_quantizer.is_static_block_quant
-            and weight_quantizer._num_bits == (2, 1)
-            and block_sizes is not None
-            and block_sizes.get("scale_bits") == (4, 3)
-        )
+        return _is_nvfp4_static_block_quantizer(weight_quantizer)
+
+    shared_global_amax_by_quantizer_id: dict[int, torch.Tensor] = {}
 
     def _promote_nvfp4_static_quantizer(
         weight_quantizer: TensorQuantizer, initial_amax: torch.Tensor | None
     ) -> None:
         if not _is_nvfp4_static_quantizer(weight_quantizer):
             return
-        global_amax = reduce_amax(initial_amax, axis=None) if initial_amax is not None else None
+        global_amax = _select_nvfp4_global_amax(
+            weight_quantizer,
+            initial_amax,
+            shared_global_amax_by_quantizer_id,
+        )
         NVFP4StaticQuantizer.from_tensor_quantizer(weight_quantizer, global_amax=global_amax)
 
     def _promote_all_nvfp4_static_weight_quantizers() -> int:
@@ -1359,6 +1457,7 @@ def local_hessian_calibrate(
     # This calibrates both weight_quantizer and input_quantizer with max calibration.
     if stage in {"start", "max_loop"}:
         print_rank_0("local_hessian: Running max calibration for all quantizers...")
+        phase_start_time = time.perf_counter()
         max_start = int(resume.data.get("max_forward_step", 0)) if stage == "max_loop" else 0
         if max_start > 0 or extend_completed_checkpoint:
             unsupported = _seed_calibrator_from_quantizer_amax(model)
@@ -1375,6 +1474,15 @@ def local_hessian_calibrate(
             distributed_sync,
             resume=resume if resume.enabled else None,
             max_forward_start_step=max_start,
+        )
+        phase_durations["max_calibration_forward"] = time.perf_counter() - phase_start_time
+        print_rank_0(
+            "local_hessian timing: max_calibration_forward="
+            f"{format_duration(phase_durations['max_calibration_forward'])}"
+        )
+        record_timing_event(
+            "local_hessian.max_calibration_forward",
+            phase_durations["max_calibration_forward"],
         )
         resume.save(model, "after_max")
         stage = "after_max"
@@ -1411,6 +1519,7 @@ def local_hessian_calibrate(
                 )
 
         if stage in {"after_max", "hessian_cache_loop"}:
+            phase_start_time = time.perf_counter()
             if len(weight_quantizers_info) == 0:
                 print_rank_0(
                     "local_hessian: no eligible modules for Hessian cache; skipping cache pass."
@@ -1548,8 +1657,26 @@ def local_hessian_calibrate(
                     )
                 stage = "after_hessian_cache"
                 LocalHessianHelper.cache_mode = False
+            phase_durations["hessian_cache_forward"] = time.perf_counter() - phase_start_time
+            print_rank_0(
+                "local_hessian timing: hessian_cache_forward="
+                f"{format_duration(phase_durations['hessian_cache_forward'])}"
+            )
+            record_timing_event(
+                "local_hessian.hessian_cache_forward",
+                phase_durations["hessian_cache_forward"],
+            )
 
         # TODO(fridah-nv): Sync Hessian across distributed processes if needed
+
+        shared_global_amax_by_quantizer_id, synced_gate_up_pairs = (
+            _collect_moe_gate_up_shared_nvfp4_global_amax(model)
+        )
+        if synced_gate_up_pairs:
+            print_rank_0(
+                "local_hessian: using shared NVFP4 global_amax for "
+                f"{synced_gate_up_pairs} gate/up expert pair(s)."
+            )
 
         # Replace calibrators with MseCalibrator using local Hessian error function
         print_rank_0("local_hessian: Running MSE calibration with local Hessian loss...")
@@ -1648,6 +1775,7 @@ def local_hessian_calibrate(
                     f"{len(weight_list)} weights."
                 )
 
+        phase_start_time = time.perf_counter()
         for idx in range(start_idx, len(weight_list)):
             name, module = weight_list[idx]
             weight_quantizer = module.weight_quantizer
@@ -1689,6 +1817,16 @@ def local_hessian_calibrate(
             for dev_id in range(torch.cuda.device_count()):
                 torch.cuda.synchronize(torch.device(f"cuda:{dev_id}"))
 
+        phase_durations["weight_search"] = time.perf_counter() - phase_start_time
+        print_rank_0(
+            "local_hessian timing: weight_search="
+            f"{format_duration(phase_durations['weight_search'])}"
+        )
+        record_timing_event(
+            "local_hessian.weight_search",
+            phase_durations["weight_search"],
+        )
+
         promoted = _promote_all_nvfp4_static_weight_quantizers()
         if promoted:
             print_rank_0(
@@ -1709,6 +1847,21 @@ def local_hessian_calibrate(
             if helper is not None:
                 helper.cleanup()
 
+    total_duration = time.perf_counter() - total_start_time
+    if phase_durations:
+        summary_parts = [
+            f"{name}={format_duration(duration)}" for name, duration in phase_durations.items()
+        ]
+        summary_parts.append(f"total={format_duration(total_duration)}")
+        print_rank_0("local_hessian timing summary: " + ", ".join(summary_parts))
+        record_timing_event(
+            "local_hessian.summary",
+            total_duration,
+            phases_seconds={name: float(duration) for name, duration in phase_durations.items()},
+            phases_duration={
+                name: format_duration(duration) for name, duration in phase_durations.items()
+            },
+        )
     print_rank_0("local_hessian: Calibration complete.")
 
 
