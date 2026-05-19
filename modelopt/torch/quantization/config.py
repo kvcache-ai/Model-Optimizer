@@ -1511,6 +1511,16 @@ class LocalHessianCalibConfig(QuantizeAlgorithmConfig):
         description="If True, module's local Hessian metadata will be kept as a module attribute.",
     )
 
+    resume_stop_stage: Literal["after_max", "after_hessian_cache"] | None = ModeloptField(
+        default=None,
+        title="Stop local Hessian calibration after a resumable stage.",
+        description=(
+            "If set to after_max, local_hessian calibration writes only max statistics and returns. If set to after_hessian_cache, it writes the resume "
+            "checkpoint containing max and Hessian statistics and returns before weight search. "
+            "This is intended for sharded calibration-stat collection before checkpoint merge."
+        ),
+    )
+
 
 class SmoothQuantCalibConfig(QuantizeAlgorithmConfig):
     """The config for ``smoothquant`` algorithm (SmoothQuant).

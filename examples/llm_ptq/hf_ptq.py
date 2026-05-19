@@ -264,6 +264,11 @@ def _augment_algorithm_with_resume_cfg(
     cfg["resume_weight_save_interval"] = args.resume_weight_save_interval
     cfg["resume_keep_checkpoint"] = args.resume_keep_checkpoint
     cfg["resume_extend_calib"] = args.resume_extend_calib
+    if getattr(args, "resume_stop_stage", None) is not None:
+        if cfg.get("method") == "local_hessian":
+            cfg["resume_stop_stage"] = args.resume_stop_stage
+        else:
+            warnings.warn("--resume_stop_stage is only supported for local_hessian; ignoring it.")
     return cfg
 
 
@@ -751,6 +756,19 @@ def mono_quantize(
         warnings.warn("Skipping quantization: model is already quantized.")
 
 
+
+def _sanitize_generation_config_for_save(model):
+    gen_config = getattr(model, "generation_config", None)
+    if gen_config is None:
+        return
+    if not getattr(gen_config, "do_sample", False) and getattr(gen_config, "top_p", None) not in (None, 1.0):
+        print(
+            "Sanitizing generation_config.top_p to 1.0 for transformers save_pretrained "
+            "because do_sample is False."
+        )
+        gen_config.top_p = 1.0
+
+
 def export_quantized(
     args: argparse.Namespace,
     full_model: torch.nn.Module,
@@ -864,6 +882,7 @@ def export_quantized(
                 if mtp_layer_prefixes:
                     full_model._mtp_layer_prefixes = mtp_layer_prefixes
 
+                _sanitize_generation_config_for_save(full_model)
                 export_hf_checkpoint(
                     full_model,
                     export_dir=export_path,
@@ -1237,6 +1256,9 @@ def quantize_main(
                 calib_dataloader,
                 is_nemotron_vl_model,
             )
+            if isinstance(quant_cfg.get("algorithm"), dict) and quant_cfg["algorithm"].get("resume_stop_stage") is not None:
+                print("Stopped after resumable calibration statistics collection; skipping post-quantization and export.")
+                return
         else:
             assert model_type != "dbrx", f"Does not support export {model_type} without quantizaton"
             print(f"qformat: {args.qformat}. No quantization applied, export {device} model")
@@ -1522,6 +1544,15 @@ def parse_args() -> argparse.Namespace:
             "as additional data to append."
         ),
     )
+    parser.add_argument(
+        "--resume_stop_stage",
+        choices=["after_max", "after_hessian_cache"],
+        default=None,
+        help=(
+            "For local_hessian only: stop after writing the selected resume stage. "
+            "Use this on calibration shards before merging their resume checkpoints."
+        ),
+    )
 
     args = parser.parse_args()
     if args.resume_max_save_interval <= 0:
@@ -1532,6 +1563,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--resume_weight_save_interval must be > 0.")
     if args.resume_extend_calib and args.resume_checkpoint_dir is None:
         parser.error("--resume_extend_calib requires --resume_checkpoint_dir.")
+    if args.resume_stop_stage is not None and args.resume_checkpoint_dir is None:
+        parser.error("--resume_stop_stage requires --resume_checkpoint_dir.")
     if args.moe_calib_experts_ratio is not None and not (0.0 < args.moe_calib_experts_ratio <= 1.0):
         parser.error("--moe_calib_experts_ratio must be in the range (0.0, 1.0].")
 

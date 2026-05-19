@@ -55,6 +55,17 @@ def _export_fused_experts(module: nn.Module, dtype: torch.dtype) -> None:
 
     gate_up = module.gate_up_proj.data
     down = module.down_proj.data
+    gate_up_scales = getattr(module, "gate_up_proj_scale_inv", None)
+    down_scales = getattr(module, "down_proj_scale_inv", None)
+
+    def _dequantize_fp8_weight(weight: torch.Tensor, scale_inv: torch.Tensor | None) -> torch.Tensor:
+        if scale_inv is None or weight.element_size() > 1:
+            return weight
+        block_out, block_in = getattr(module, "block_size", None) or (128, 128)
+        scale = scale_inv.to(device=weight.device, dtype=torch.float32)
+        scale = scale.repeat_interleave(int(block_out), dim=0)[: weight.shape[0], :]
+        scale = scale.repeat_interleave(int(block_in), dim=1)[:, : weight.shape[1]]
+        return weight.to(torch.float32) * scale
 
     # 2-3. Split + export each per-expert projection.
     fused_dim0 = gate_up.shape[1]  # 2 * expert_dim
@@ -118,8 +129,21 @@ def _export_fused_experts(module: nn.Module, dtype: torch.dtype) -> None:
                     stacklevel=2,
                 )
 
+            if is_gate_up:
+                expert_scales = gate_up_scales[idx] if isinstance(gate_up_scales, torch.Tensor) else None
+                if expert_scales is not None and expert_scales.dim() >= 1:
+                    scale_rows = expert_scales.shape[0]
+                    if fused_total % scale_rows == 0:
+                        scale_start = fused_start * scale_rows // fused_total
+                        scale_end = (fused_start + weight_slice.shape[0]) * scale_rows // fused_total
+                        expert_scales = expert_scales[scale_start:scale_end].contiguous()
+            else:
+                expert_scales = down_scales[idx] if isinstance(down_scales, torch.Tensor) else None
+
             wrapper = nn.Module()
-            wrapper.weight = nn.Parameter(weight_slice.contiguous(), requires_grad=False)
+            wrapper.weight = nn.Parameter(
+                _dequantize_fp8_weight(weight_slice, expert_scales).contiguous(), requires_grad=False
+            )
             wrapper.weight_quantizer = w_quantizer
             wrapper.input_quantizer = i_quantizer
 

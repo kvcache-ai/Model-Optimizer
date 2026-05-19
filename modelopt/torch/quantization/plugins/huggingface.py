@@ -853,30 +853,64 @@ class _QuantFusedExperts(_QuantFunctionalMixin):
         self._register_temp_attribute("_down_proj_linear", False)
         self._register_temp_attribute("_current_expert_idx", 0)
 
+    def _dequantize_fp8_expert_weight(
+        self, weight: torch.Tensor, weight_scale_inv: torch.Tensor | None
+    ) -> torch.Tensor:
+        if weight_scale_inv is None or weight.element_size() > 1:
+            return weight
+        block_size = getattr(self, "block_size", None) or (128, 128)
+        block_out, block_in = int(block_size[0]), int(block_size[1])
+        scale = weight_scale_inv.to(device=weight.device, dtype=torch.float32)
+        scale = scale.repeat_interleave(block_out, dim=0)[: weight.shape[0], :]
+        scale = scale.repeat_interleave(block_in, dim=1)[:, : weight.shape[1]]
+        return weight.to(torch.float32) * scale
+
     @property
     def functionals_to_replace(self):
         _orig_linear = torch.nn.functional.linear
 
-        # The HF fused expert forward calls F.linear exactly twice per expert
-        # in strict alternation: first for gate_up_proj, then for down_proj.
-        # forward() resets the toggle before each call to super().forward().
-        def _quantized_linear(input, weight, bias=None):
+        def _select_quantizers(weight):
             if self._down_proj_linear:
                 idx = self._current_expert_idx
-                input = self.down_proj_input_quantizer(input)
-                weight = self.down_proj_weight_quantizers[idx](weight)
+                input_quantizer = self.down_proj_input_quantizer
+                weight_quantizer = self.down_proj_weight_quantizers[idx]
             else:
                 idx = self._get_expert_idx_from_gate_up(weight)
                 self._current_expert_idx = idx
-                input = self.gate_up_proj_input_quantizer(input)
-                weight = self.gate_up_proj_weight_quantizers[idx](weight)
+                input_quantizer = self.gate_up_proj_input_quantizer
+                weight_quantizer = self.gate_up_proj_weight_quantizers[idx]
             self._down_proj_linear = not self._down_proj_linear
+            return input_quantizer, weight_quantizer
+
+        def _should_quantize_weight(weight_quantizer):
+            if getattr(weight_quantizer, "_if_calib", False):
+                return True
+            is_unpromoted_nvfp4 = (
+                getattr(weight_quantizer, "is_static_block_quant", False)
+                and getattr(weight_quantizer, "_num_bits", None) == (2, 1)
+                and not hasattr(weight_quantizer, "global_amax")
+            )
+            return not is_unpromoted_nvfp4
+
+        def _quantized_linear(input, weight, bias=None):
+            input_quantizer, weight_quantizer = _select_quantizers(weight)
+            input = input_quantizer(input)
+            if _should_quantize_weight(weight_quantizer):
+                weight = weight_quantizer(weight)
             return _orig_linear(input, weight, bias)
 
-        return [
-            (torch.nn.functional, "linear", _quantized_linear),
-        ]
+        def _quantized_fp8_linear(input, weight, weight_scale_inv):
+            input_quantizer, weight_quantizer = _select_quantizers(weight)
+            input = input_quantizer(input)
+            weight = self._dequantize_fp8_expert_weight(weight, weight_scale_inv).to(input.dtype)
+            if _should_quantize_weight(weight_quantizer):
+                weight = weight_quantizer(weight)
+            return _orig_linear(input, weight, None)
 
+        replacements = [(torch.nn.functional, "linear", _quantized_linear)]
+        if hasattr(self, "linear"):
+            replacements.append((self, "linear", _quantized_fp8_linear))
+        return replacements
     def forward(self, *args, **kwargs):
         self._down_proj_linear = False
         return super().forward(*args, **kwargs)

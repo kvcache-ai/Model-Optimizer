@@ -1114,6 +1114,7 @@ def local_hessian_calibrate(
     resume_weight_save_interval: int = 256,
     resume_keep_checkpoint: bool = False,
     resume_extend_calib: bool = False,
+    resume_stop_stage: str | None = None,
 ):
     """Calibrate the model using local Hessian-weighted MSE search.
 
@@ -1136,6 +1137,9 @@ def local_hessian_calibrate(
             for NVFP4 per-block quantization (default: True).
         block_size: Block size for local Hessian computation (default: 16).
         debug: If True, keep the local Hessian metadata on modules.
+        resume_stop_stage: If set to "after_max", return after writing max statistics.
+            If set to "after_hessian_cache", return after writing max and Hessian resume
+            statistics, before weight search.
 
     See :class:`LocalHessianCalibConfig <modelopt.torch.quantization.config.LocalHessianCalibConfig>`
     for details on the configuration options.
@@ -1196,6 +1200,8 @@ def local_hessian_calibrate(
     elif stage == "done":
         print_rank_0("local_hessian calibration already completed in existing resume checkpoint.")
         return
+
+    name_to_module = dict(model.named_modules())
 
     def _get_module_tensor_attr(module: nn.Module, attr_name: str) -> torch.Tensor | None:
         attr = module._parameters.get(attr_name)
@@ -1267,6 +1273,51 @@ def local_hessian_calibrate(
     def _is_nvfp4_static_quantizer(weight_quantizer: TensorQuantizer) -> bool:
         return _is_nvfp4_static_block_quantizer(weight_quantizer)
 
+    def _dequantize_fused_fp8_weight(module, weight, scale_inv):
+        if scale_inv is None or weight.element_size() > 1:
+            return weight
+        bo, bi = (getattr(module, "block_size", None) or (128, 128))
+        scale = scale_inv.to(device=weight.device, dtype=torch.float32)
+        scale = scale.repeat_interleave(int(bo), dim=0)[: weight.shape[0], :]
+        scale = scale.repeat_interleave(int(bi), dim=1)[:, : weight.shape[1]]
+        return weight.to(torch.float32) * scale
+
+    def _iter_fused_expert_weight_quantizers():
+        for module_name, module in name_to_module.items():
+            gq = getattr(module, "gate_up_proj_weight_quantizers", None)
+            dq = getattr(module, "down_proj_weight_quantizers", None)
+            gw = getattr(module, "gate_up_proj", None)
+            dw = getattr(module, "down_proj", None)
+            if gq is None or dq is None or not isinstance(gw, torch.Tensor) or not isinstance(dw, torch.Tensor):
+                continue
+            gs = getattr(module, "gate_up_proj_scale_inv", None)
+            ds = getattr(module, "down_proj_scale_inv", None)
+            for idx, wq in enumerate(gq):
+                if isinstance(wq, TensorQuantizer) and wq.is_enabled:
+                    yield module_name + ".gate_up_proj_weight_quantizers." + str(idx), module, gw[idx], gs[idx] if isinstance(gs, torch.Tensor) else None, wq
+            for idx, wq in enumerate(dq):
+                if isinstance(wq, TensorQuantizer) and wq.is_enabled:
+                    yield module_name + ".down_proj_weight_quantizers." + str(idx), module, dw[idx], ds[idx] if isinstance(ds, torch.Tensor) else None, wq
+
+    def _initialize_missing_fused_expert_weight_amax():
+        initialized = 0
+        for _name, module, weight, scale, wq in _iter_fused_expert_weight_quantizers():
+            if getattr(wq, "_dynamic", False) or getattr(wq, "_use_constant_amax", False) or getattr(wq, "_calibrator", None) is None or getattr(wq, "_amax", None) is not None:
+                continue
+            was_q, was_c = getattr(wq, "_if_quant", True), getattr(wq, "_if_calib", False)
+            wq.disable_quant(); wq.enable_calib()
+            try:
+                wq(_dequantize_fused_fp8_weight(module, weight, scale))
+                cal = getattr(wq, "_calibrator", None)
+                if cal is not None and cal.compute_amax() is not None:
+                    wq.load_calib_amax(); initialized += 1
+                if cal is not None and hasattr(cal, "reset"):
+                    cal.reset()
+            finally:
+                wq.enable_quant() if was_q else wq.disable_quant()
+                wq.enable_calib() if was_c else wq.disable_calib()
+        return initialized
+
     shared_global_amax_by_quantizer_id: dict[int, torch.Tensor] = {}
 
     def _promote_nvfp4_static_quantizer(
@@ -1283,20 +1334,31 @@ def local_hessian_calibrate(
 
     def _promote_all_nvfp4_static_weight_quantizers() -> int:
         promoted = 0
-        for module in name_to_module.values():
-            weight_quantizer = getattr(module, "weight_quantizer", None)
-            if not isinstance(weight_quantizer, TensorQuantizer):
-                continue
+        seen_quantizer_ids: set[int] = set()
+
+        def _maybe_promote(weight_quantizer: TensorQuantizer) -> None:
+            nonlocal promoted
+            if id(weight_quantizer) in seen_quantizer_ids:
+                return
+            seen_quantizer_ids.add(id(weight_quantizer))
             if not getattr(weight_quantizer, "is_enabled", False):
-                continue
+                return
             if not _is_nvfp4_static_quantizer(weight_quantizer):
-                continue
+                return
             was_static = isinstance(weight_quantizer, NVFP4StaticQuantizer)
             has_amax = hasattr(weight_quantizer, "_amax") and weight_quantizer._amax is not None
             initial_amax = weight_quantizer._amax.clone().detach() if has_amax else None
             _promote_nvfp4_static_quantizer(weight_quantizer, initial_amax)
             if not was_static:
                 promoted += 1
+
+        for module in name_to_module.values():
+            weight_quantizer = getattr(module, "weight_quantizer", None)
+            if isinstance(weight_quantizer, TensorQuantizer):
+                _maybe_promote(weight_quantizer)
+
+        for _name, _module, _weight, _scale, weight_quantizer in _iter_fused_expert_weight_quantizers():
+            _maybe_promote(weight_quantizer)
         return promoted
 
     class LocalHessianHelper:
@@ -1484,8 +1546,17 @@ def local_hessian_calibrate(
             "local_hessian.max_calibration_forward",
             phase_durations["max_calibration_forward"],
         )
+        initialized_fused_weight_amax = _initialize_missing_fused_expert_weight_amax()
+        if initialized_fused_weight_amax:
+            print_rank_0(
+                "local_hessian: initialized fused expert weight amax for "
+                f"{initialized_fused_weight_amax} quantizer(s) without forward calibration hits."
+            )
         resume.save(model, "after_max")
         stage = "after_max"
+        if resume_stop_stage == "after_max":
+            print_rank_0("local_hessian: stopped after max calibration checkpoint for later amax merge.")
+            return
         if extend_completed_checkpoint:
             stage = "hessian_cache_loop"
 
@@ -1658,6 +1729,9 @@ def local_hessian_calibrate(
                 stage = "after_hessian_cache"
                 LocalHessianHelper.cache_mode = False
             phase_durations["hessian_cache_forward"] = time.perf_counter() - phase_start_time
+            if resume_stop_stage == "after_hessian_cache":
+                print_rank_0("local_hessian: stopped after hessian cache checkpoint for later merge.")
+                return
             print_rank_0(
                 "local_hessian timing: hessian_cache_forward="
                 f"{format_duration(phase_durations['hessian_cache_forward'])}"
@@ -1668,6 +1742,13 @@ def local_hessian_calibrate(
             )
 
         # TODO(fridah-nv): Sync Hessian across distributed processes if needed
+
+        initialized_fused_weight_amax = _initialize_missing_fused_expert_weight_amax()
+        if initialized_fused_weight_amax:
+            print_rank_0(
+                "local_hessian: initialized fused expert weight amax for "
+                f"{initialized_fused_weight_amax} quantizer(s) before weight search."
+            )
 
         shared_global_amax_by_quantizer_id, synced_gate_up_pairs = (
             _collect_moe_gate_up_shared_nvfp4_global_amax(model)
