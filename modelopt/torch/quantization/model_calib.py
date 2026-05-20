@@ -1288,29 +1288,57 @@ def local_hessian_calibrate(
             dq = getattr(module, "down_proj_weight_quantizers", None)
             gw = getattr(module, "gate_up_proj", None)
             dw = getattr(module, "down_proj", None)
-            if gq is None or dq is None or not isinstance(gw, torch.Tensor) or not isinstance(dw, torch.Tensor):
+            if (
+                gq is None
+                or dq is None
+                or not isinstance(gw, torch.Tensor)
+                or not isinstance(dw, torch.Tensor)
+            ):
                 continue
             gs = getattr(module, "gate_up_proj_scale_inv", None)
             ds = getattr(module, "down_proj_scale_inv", None)
             for idx, wq in enumerate(gq):
                 if isinstance(wq, TensorQuantizer) and wq.is_enabled:
-                    yield module_name + ".gate_up_proj_weight_quantizers." + str(idx), module, gw[idx], gs[idx] if isinstance(gs, torch.Tensor) else None, wq
+                    yield (
+                        module_name + ".gate_up_proj_weight_quantizers." + str(idx),
+                        module,
+                        "gate_up_proj_weight_quantizers",
+                        idx,
+                        gw[idx],
+                        gs[idx] if isinstance(gs, torch.Tensor) else None,
+                        wq,
+                    )
             for idx, wq in enumerate(dq):
                 if isinstance(wq, TensorQuantizer) and wq.is_enabled:
-                    yield module_name + ".down_proj_weight_quantizers." + str(idx), module, dw[idx], ds[idx] if isinstance(ds, torch.Tensor) else None, wq
+                    yield (
+                        module_name + ".down_proj_weight_quantizers." + str(idx),
+                        module,
+                        "down_proj_weight_quantizers",
+                        idx,
+                        dw[idx],
+                        ds[idx] if isinstance(ds, torch.Tensor) else None,
+                        wq,
+                    )
 
     def _initialize_missing_fused_expert_weight_amax():
         initialized = 0
-        for _name, module, weight, scale, wq in _iter_fused_expert_weight_quantizers():
-            if getattr(wq, "_dynamic", False) or getattr(wq, "_use_constant_amax", False) or getattr(wq, "_calibrator", None) is None or getattr(wq, "_amax", None) is not None:
+        for _name, module, _quantizer_attr, _expert_idx, weight, scale, wq in _iter_fused_expert_weight_quantizers():
+            if (
+                getattr(wq, "_dynamic", False)
+                or getattr(wq, "_use_constant_amax", False)
+                or getattr(wq, "_calibrator", None) is None
+                or getattr(wq, "_amax", None) is not None
+            ):
                 continue
             was_q, was_c = getattr(wq, "_if_quant", True), getattr(wq, "_if_calib", False)
-            wq.disable_quant(); wq.enable_calib()
+            wq.disable_quant()
+            wq.enable_calib()
             try:
                 wq(_dequantize_fused_fp8_weight(module, weight, scale))
                 cal = getattr(wq, "_calibrator", None)
                 if cal is not None and cal.compute_amax() is not None:
-                    wq.load_calib_amax(); initialized += 1
+                    wq.load_calib_amax()
+                    initialized += 1
                 if cal is not None and hasattr(cal, "reset"):
                     cal.reset()
             finally:
@@ -1357,7 +1385,15 @@ def local_hessian_calibrate(
             if isinstance(weight_quantizer, TensorQuantizer):
                 _maybe_promote(weight_quantizer)
 
-        for _name, _module, _weight, _scale, weight_quantizer in _iter_fused_expert_weight_quantizers():
+        for (
+            _name,
+            _module,
+            _quantizer_attr,
+            _expert_idx,
+            _weight,
+            _scale,
+            weight_quantizer,
+        ) in _iter_fused_expert_weight_quantizers():
             _maybe_promote(weight_quantizer)
         return promoted
 
@@ -1366,15 +1402,23 @@ def local_hessian_calibrate(
 
         cache_mode: bool = False
 
-        def __init__(self, module, name):
+        def __init__(
+            self,
+            module,
+            name,
+            weight_shape: tuple[int, int] | None = None,
+            weight_device: torch.device | None = None,
+            bind_forward: bool = True,
+        ):
             self.name = name
             self.module = module
-            self.weight_shape = _infer_weight_shape(module)  # (cout, cin)
+            self.weight_shape = weight_shape if weight_shape is not None else _infer_weight_shape(module)
             self.cout, self.cin = self.weight_shape
             self.block_size = block_size
             self.num_blocks_per_cin = self.cin // block_size
             self.is_enabled = True
-            self.weight_device = _infer_weight_device(module)
+            self.weight_device = weight_device if weight_device is not None else _infer_weight_device(module)
+            self.bind_forward = bind_forward
 
             # Accumulated Hessian per block: (cin // block_size, block_size, block_size)
             self.hessian_per_block = torch.zeros(
@@ -1389,7 +1433,8 @@ def local_hessian_calibrate(
         def setup(self):
             """Set up the forward hook to collect activations."""
             module = self.module
-            bind_forward_method(module, forward, "_forward_no_local_hessian")
+            if self.bind_forward:
+                bind_forward_method(module, forward, "_forward_no_local_hessian")
 
             # Check if cin is divisible by block_size
             if self.cin % self.block_size != 0:
@@ -1401,9 +1446,10 @@ def local_hessian_calibrate(
 
         def cleanup(self):
             """Clean up the forward hook."""
-            unpatch_forward_method(self.module, "_forward_no_local_hessian")
+            if self.bind_forward:
+                unpatch_forward_method(self.module, "_forward_no_local_hessian")
             if not debug:
-                if hasattr(self.module, "hessian_helper"):
+                if self.module is not None and hasattr(self.module, "hessian_helper"):
                     delattr(self.module, "hessian_helper")
 
         def accumulate_hessian(self, input_tensor: torch.Tensor):
@@ -1473,15 +1519,16 @@ def local_hessian_calibrate(
         return self._forward_no_local_hessian(input, *args, **kwargs)
 
     def _reset_hessian_helpers() -> None:
-        for _, module in weight_quantizers_info:
-            helper = module.hessian_helper
+        for info in weight_hessian_infos:
+            helper = info["helper"]
             helper.hessian_per_block.zero_()
             helper.num_samples = 0
 
     def _collect_hessian_cache_state() -> dict[str, dict[str, object]]:
         state: dict[str, dict[str, object]] = {}
-        for name, module in weight_quantizers_info:
-            helper = module.hessian_helper
+        for info in weight_hessian_infos:
+            name = info["name"]
+            helper = info["helper"]
             state[name] = {
                 "hessian_per_block": helper.hessian_per_block.detach().cpu(),
                 "num_samples": int(helper.num_samples),
@@ -1494,7 +1541,8 @@ def local_hessian_calibrate(
             return 0
 
         restored = 0
-        for name, module in weight_quantizers_info:
+        for info in weight_hessian_infos:
+            name = info["name"]
             helper_state = helpers_state.get(name)
             if not isinstance(helper_state, dict):
                 continue
@@ -1504,7 +1552,7 @@ def local_hessian_calibrate(
             if not isinstance(hessian_tensor, torch.Tensor):
                 continue
 
-            helper = module.hessian_helper
+            helper = info["helper"]
             if hessian_tensor.shape != helper.hessian_per_block.shape:
                 continue
 
@@ -1563,7 +1611,9 @@ def local_hessian_calibrate(
     # Setup helpers for all quantized linear modules
     name_to_module = dict(model.named_modules())
     weight_quantizers_info = []
+    weight_hessian_infos: list[dict[str, object]] = []
     all_patched_modules = []  # Track all modules for cleanup (including disabled ones)
+    fused_hessian_modules = []
 
     try:
         for name, module in name_to_module.items():
@@ -1573,14 +1623,64 @@ def local_hessian_calibrate(
                 module.hessian_helper.setup()
                 if module.hessian_helper.is_enabled:
                     weight_quantizers_info.append((name, module))
+                    weight_hessian_infos.append(
+                        {
+                            "name": name,
+                            "module": module,
+                            "weight_quantizer": module.weight_quantizer,
+                            "helper": module.hessian_helper,
+                            "fused": False,
+                        }
+                    )
 
-        if stage in {"after_hessian_cache", "weight_loop"} and weight_quantizers_info:
+        for (
+            name,
+            module,
+            quantizer_attr,
+            expert_idx,
+            weight,
+            scale,
+            weight_quantizer,
+        ) in _iter_fused_expert_weight_quantizers():
+            weight_shape = _normalize_weight_shape(weight.shape)
+            if weight_shape is None:
+                continue
+            helper = LocalHessianHelper(
+                module,
+                name,
+                weight_shape=weight_shape,
+                weight_device=weight.device,
+                bind_forward=False,
+            )
+            helper.setup()
+            if not helper.is_enabled:
+                continue
+            helper_map = getattr(module, "_local_hessian_fused_helpers", None)
+            if helper_map is None:
+                helper_map = {}
+                setattr(module, "_local_hessian_fused_helpers", helper_map)
+            helper_map[f"{quantizer_attr}.{expert_idx}"] = helper
+            if module not in fused_hessian_modules:
+                fused_hessian_modules.append(module)
+            weight_hessian_infos.append(
+                {
+                    "name": name,
+                    "module": module,
+                    "weight_quantizer": weight_quantizer,
+                    "helper": helper,
+                    "fused": True,
+                    "weight": weight,
+                    "scale": scale,
+                }
+            )
+
+        if stage in {"after_hessian_cache", "weight_loop"} and weight_hessian_infos:
             aux_state = resume.load_aux_state()
             restored_count = _restore_hessian_cache_state(aux_state) if isinstance(aux_state, dict) else 0
-            if restored_count != len(weight_quantizers_info):
+            if restored_count != len(weight_hessian_infos):
                 print_rank_0(
                     "local_hessian: resume checkpoint is missing complete hessian cache state "
-                    f"({restored_count}/{len(weight_quantizers_info)} restored). "
+                    f"({restored_count}/{len(weight_hessian_infos)} restored). "
                     "Rebuilding hessian cache from after_max."
                 )
                 stage = "after_max"
@@ -1591,7 +1691,7 @@ def local_hessian_calibrate(
 
         if stage in {"after_max", "hessian_cache_loop"}:
             phase_start_time = time.perf_counter()
-            if len(weight_quantizers_info) == 0:
+            if len(weight_hessian_infos) == 0:
                 print_rank_0(
                     "local_hessian: no eligible modules for Hessian cache; skipping cache pass."
                 )
@@ -1606,6 +1706,8 @@ def local_hessian_calibrate(
             else:
                 # Cache activations by running forward loop
                 LocalHessianHelper.cache_mode = True
+                for module in fused_hessian_modules:
+                    setattr(module, "_local_hessian_fused_cache_mode", True)
                 print_rank_0("local_hessian: Caching activations and computing local Hessian...")
 
                 cache_start_step = (
@@ -1618,10 +1720,10 @@ def local_hessian_calibrate(
                 if extend_completed_checkpoint:
                     aux_state = resume.load_aux_state()
                     restored_count = _restore_hessian_cache_state(aux_state) if isinstance(aux_state, dict) else 0
-                    if restored_count != len(weight_quantizers_info):
+                    if restored_count != len(weight_hessian_infos):
                         raise RuntimeError(
                             "local_hessian cannot extend a completed checkpoint without complete "
-                            f"hessian cache state ({restored_count}/{len(weight_quantizers_info)} restored). "
+                            f"hessian cache state ({restored_count}/{len(weight_hessian_infos)} restored). "
                             "Run the original calibration with --resume_keep_checkpoint using the new "
                             "checkpoint format, or start from scratch."
                         )
@@ -1639,7 +1741,7 @@ def local_hessian_calibrate(
                         cache_start_step = 0
                     else:
                         restored_count = _restore_hessian_cache_state(aux_state)
-                        if restored_count != len(weight_quantizers_info):
+                        if restored_count != len(weight_hessian_infos):
                             cached_entries = 0
                             if isinstance(aux_state, dict):
                                 helpers_state = aux_state.get("hessian_helpers", {})
@@ -1648,7 +1750,7 @@ def local_hessian_calibrate(
                             print_rank_0(
                                 "local_hessian: failed to restore cached hessian accumulators "
                                 f"(restored={restored_count}, cached_entries={cached_entries}, "
-                                f"helpers={len(weight_quantizers_info)}); restarting cache pass from step 0."
+                                f"helpers={len(weight_hessian_infos)}); restarting cache pass from step 0."
                             )
                             _reset_hessian_helpers()
                             cache_start_step = 0
@@ -1728,6 +1830,8 @@ def local_hessian_calibrate(
                     )
                 stage = "after_hessian_cache"
                 LocalHessianHelper.cache_mode = False
+                for module in fused_hessian_modules:
+                    setattr(module, "_local_hessian_fused_cache_mode", False)
             phase_durations["hessian_cache_forward"] = time.perf_counter() - phase_start_time
             if resume_stop_stage == "after_hessian_cache":
                 print_rank_0("local_hessian: stopped after hessian cache checkpoint for later merge.")
@@ -1762,9 +1866,10 @@ def local_hessian_calibrate(
         # Replace calibrators with MseCalibrator using local Hessian error function
         print_rank_0("local_hessian: Running MSE calibration with local Hessian loss...")
         skip_weight_quantizer_ids: set[int] = set()
-        for name, module in weight_quantizers_info:
-            weight_quantizer = module.weight_quantizer
-            helper = module.hessian_helper
+        for info in weight_hessian_infos:
+            name = info["name"]
+            weight_quantizer = info["weight_quantizer"]
+            helper = info["helper"]
 
             has_amax = hasattr(weight_quantizer, "_amax") and weight_quantizer._amax is not None
             initial_amax = weight_quantizer._amax.clone().detach() if has_amax else None
@@ -1835,12 +1940,12 @@ def local_hessian_calibrate(
 
         # Process weights ONE AT A TIME with immediate amax computation and cleanup
         weight_list = [
-            (name, module)
-            for name, module in weight_quantizers_info
-            if id(module.weight_quantizer) not in skip_weight_quantizer_ids
-            and module.weight_quantizer._calibrator is not None
+            info
+            for info in weight_hessian_infos
+            if id(info["weight_quantizer"]) not in skip_weight_quantizer_ids
+            and info["weight_quantizer"]._calibrator is not None
         ]
-        weight_keys = [name for name, _ in weight_list]
+        weight_keys = [info["name"] for info in weight_list]
         start_idx = 0
         if stage == "weight_loop":
             saved_weight_keys = resume.data.get("weight_keys")
@@ -1858,17 +1963,26 @@ def local_hessian_calibrate(
 
         phase_start_time = time.perf_counter()
         for idx in range(start_idx, len(weight_list)):
-            name, module = weight_list[idx]
-            weight_quantizer = module.weight_quantizer
+            info = weight_list[idx]
+            module = info["module"]
+            weight_quantizer = info["weight_quantizer"]
             cal = weight_quantizer._calibrator
 
             try:
                 # Step 1: Calibrate this weight
                 weight_quantizer.disable_quant()
                 weight_quantizer.enable_calib()
-                with enable_weight_access_and_writeback(module, model, name_to_module):
-                    weight = module.weight
+                if info.get("fused", False):
+                    weight = _dequantize_fused_fp8_weight(
+                        module,
+                        info["weight"],
+                        info.get("scale"),
+                    )
                     weight_quantizer(weight)
+                else:
+                    with enable_weight_access_and_writeback(module, model, name_to_module):
+                        weight = module.weight
+                        weight_quantizer(weight)
 
                 # Step 2: IMMEDIATELY compute amax before calibration data grows
                 if cal.compute_amax() is not None:
@@ -1923,6 +2037,10 @@ def local_hessian_calibrate(
         resume.finalize(success=True)
     finally:
         LocalHessianHelper.cache_mode = False
+        for module in fused_hessian_modules:
+            setattr(module, "_local_hessian_fused_cache_mode", False)
+            if not debug and hasattr(module, "_local_hessian_fused_helpers"):
+                setattr(module, "_local_hessian_fused_helpers", None)
         for _name, module in all_patched_modules:
             helper = getattr(module, "hessian_helper", None)
             if helper is not None:

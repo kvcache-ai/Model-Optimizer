@@ -852,6 +852,8 @@ class _QuantFusedExperts(_QuantFunctionalMixin):
 
         self._register_temp_attribute("_down_proj_linear", False)
         self._register_temp_attribute("_current_expert_idx", 0)
+        self._register_temp_attribute("_local_hessian_fused_cache_mode", False)
+        self._register_temp_attribute("_local_hessian_fused_helpers", None)
 
     def _dequantize_fp8_expert_weight(
         self, weight: torch.Tensor, weight_scale_inv: torch.Tensor | None
@@ -874,13 +876,27 @@ class _QuantFusedExperts(_QuantFunctionalMixin):
                 idx = self._current_expert_idx
                 input_quantizer = self.down_proj_input_quantizer
                 weight_quantizer = self.down_proj_weight_quantizers[idx]
+                quantizer_attr = "down_proj_weight_quantizers"
             else:
                 idx = self._get_expert_idx_from_gate_up(weight)
                 self._current_expert_idx = idx
                 input_quantizer = self.gate_up_proj_input_quantizer
                 weight_quantizer = self.gate_up_proj_weight_quantizers[idx]
+                quantizer_attr = "gate_up_proj_weight_quantizers"
             self._down_proj_linear = not self._down_proj_linear
-            return input_quantizer, weight_quantizer
+            return input_quantizer, weight_quantizer, quantizer_attr, idx
+
+        def _collect_local_hessian_input(quantizer_attr, idx, input):
+            if not getattr(self, "_local_hessian_fused_cache_mode", False):
+                return
+            helpers = getattr(self, "_local_hessian_fused_helpers", None)
+            if not helpers:
+                return
+            helper = helpers.get(f"{quantizer_attr}.{idx}")
+            if helper is None or not getattr(helper, "is_enabled", False):
+                return
+            input_local = input.to_local() if hasattr(input, "to_local") else input
+            helper.accumulate_hessian(input_local)
 
         def _should_quantize_weight(weight_quantizer):
             if getattr(weight_quantizer, "_if_calib", False):
@@ -893,17 +909,22 @@ class _QuantFusedExperts(_QuantFunctionalMixin):
             return not is_unpromoted_nvfp4
 
         def _quantized_linear(input, weight, bias=None):
-            input_quantizer, weight_quantizer = _select_quantizers(weight)
+            input_quantizer, weight_quantizer, quantizer_attr, idx = _select_quantizers(weight)
+            _collect_local_hessian_input(quantizer_attr, idx, input)
             input = input_quantizer(input)
-            if _should_quantize_weight(weight_quantizer):
+            if (
+                not getattr(self, "_local_hessian_fused_cache_mode", False)
+                and _should_quantize_weight(weight_quantizer)
+            ):
                 weight = weight_quantizer(weight)
             return _orig_linear(input, weight, bias)
 
         def _quantized_fp8_linear(input, weight, weight_scale_inv):
-            input_quantizer, weight_quantizer = _select_quantizers(weight)
+            input_quantizer, weight_quantizer, quantizer_attr, idx = _select_quantizers(weight)
+            _collect_local_hessian_input(quantizer_attr, idx, input)
             input = input_quantizer(input)
             weight = self._dequantize_fp8_expert_weight(weight, weight_scale_inv).to(input.dtype)
-            if _should_quantize_weight(weight_quantizer):
+            if not getattr(self, "_local_hessian_fused_cache_mode", False) and _should_quantize_weight(weight_quantizer):
                 weight = weight_quantizer(weight)
             return _orig_linear(input, weight, None)
 
@@ -911,6 +932,7 @@ class _QuantFusedExperts(_QuantFunctionalMixin):
         if hasattr(self, "linear"):
             replacements.append((self, "linear", _quantized_fp8_linear))
         return replacements
+
     def forward(self, *args, **kwargs):
         self._down_proj_linear = False
         return super().forward(*args, **kwargs)
