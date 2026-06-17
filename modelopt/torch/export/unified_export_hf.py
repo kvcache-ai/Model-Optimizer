@@ -168,6 +168,162 @@ def _load_safetensors_key_to_path(checkpoint_path: str | Path) -> dict[str, Path
     return key_to_path
 
 
+def _attach_fp8_source_scale_inv_buffers(
+    model: nn.Module, source_checkpoint_path: str | Path | None
+) -> int:
+    """Attach source FP8 scale_inv tensors needed to export NVFP4 from FP8 checkpoints."""
+    if source_checkpoint_path is None:
+        return 0
+
+    key_to_path = _load_safetensors_key_to_path(source_checkpoint_path)
+    if not key_to_path:
+        return 0
+
+    keys_by_path: dict[Path, list[tuple[nn.Module, str, str]]] = defaultdict(list)
+    nvfp4_formats = [QUANTIZATION_NVFP4, QUANTIZATION_NVFP4_AWQ, QUANTIZATION_NVFP4_SVDQUANT]
+    for module_name, module in model.named_modules():
+        if not module_name or not hasattr(module, "weight"):
+            continue
+        try:
+            quantization_format = get_quantization_format(module)
+        except Exception:
+            continue
+        if quantization_format not in nvfp4_formats:
+            continue
+        weight = getattr(module, "weight", None)
+        if not torch.is_tensor(weight) or weight.element_size() > 1:
+            continue
+        scale_inv_name = "weight_scale_inv"
+        if getattr(module, scale_inv_name, None) is not None:
+            continue
+        scale_inv_key = f"{module_name}.{scale_inv_name}"
+        shard_path = key_to_path.get(scale_inv_key)
+        if shard_path is None:
+            continue
+        keys_by_path[shard_path].append((module, scale_inv_name, scale_inv_key))
+
+    attached = 0
+    for shard_path, items in keys_by_path.items():
+        with safe_open(str(shard_path), framework="pt", device="cpu") as f:
+            for module, scale_inv_name, scale_inv_key in items:
+                if scale_inv_key not in f.keys():
+                    continue
+                module.register_buffer(scale_inv_name, f.get_tensor(scale_inv_key))
+                attached += 1
+
+    return attached
+
+
+def _collect_fp8_shared_expert_nvfp4_export_scales(
+    model: nn.Module,
+) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+    """Collect local-Hessian/static NVFP4 scales for GLM shared experts before export."""
+    export_scales: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    nvfp4_formats = [QUANTIZATION_NVFP4, QUANTIZATION_NVFP4_AWQ, QUANTIZATION_NVFP4_SVDQUANT]
+    for module_name, module in model.named_modules():
+        if ".mlp.shared_experts." not in module_name or not hasattr(module, "weight"):
+            continue
+        try:
+            quantization_format = get_quantization_format(module)
+        except Exception:
+            continue
+        if quantization_format not in nvfp4_formats:
+            continue
+        weight_quantizer = getattr(module, "weight_quantizer", None)
+        weight = getattr(module, "weight", None)
+        if weight_quantizer is None or weight is None or not _is_enabled_quantizer(weight_quantizer):
+            continue
+        try:
+            weight_scale_2 = NVFP4QTensor.get_weights_scaling_factor_2_from_quantizer(
+                weight_quantizer
+            ).to(weight.device)
+            weight_scale = NVFP4QTensor.get_weights_scaling_factor_from_quantizer(
+                weight_quantizer,
+                weight,
+                weight_scale_2,
+            )[0]
+        except Exception as exc:
+            warnings.warn(
+                f"Could not collect NVFP4 export scales for {module_name}: {exc}",
+                stacklevel=2,
+            )
+            continue
+        export_scales[f"{module_name}.weight"] = (
+            weight_scale.detach().cpu(),
+            weight_scale_2.detach().cpu(),
+        )
+    return export_scales
+
+
+def _dequantize_fp8_checkpoint_tensor(weight: torch.Tensor, scale_inv: torch.Tensor) -> torch.Tensor | None:
+    if weight.dim() != 2 or scale_inv.dim() != 2:
+        return None
+    block_out = (weight.shape[0] + scale_inv.shape[0] - 1) // scale_inv.shape[0]
+    block_in = (weight.shape[1] + scale_inv.shape[1] - 1) // scale_inv.shape[1]
+    scale = scale_inv.to(dtype=torch.float32)
+    scale = scale.repeat_interleave(int(block_out), dim=0)[: weight.shape[0], :]
+    scale = scale.repeat_interleave(int(block_in), dim=1)[:, : weight.shape[1]]
+    return weight.to(torch.float32) * scale
+
+
+def _requantize_fp8_shared_expert_nvfp4_weights(
+    state_dict: dict[str, Any],
+    source_checkpoint_path: str | Path | None,
+    export_scales: dict[str, tuple[torch.Tensor, torch.Tensor]],
+) -> dict[str, Any]:
+    """Repack GLM shared experts from source FP8 weights using collected NVFP4 scales."""
+    if source_checkpoint_path is None or not export_scales:
+        return state_dict
+
+    key_to_path = _load_safetensors_key_to_path(source_checkpoint_path)
+    if not key_to_path:
+        return state_dict
+
+    patched_state_dict = dict(state_dict)
+    patched = 0
+    for weight_key, (weight_scale, weight_scale_2) in export_scales.items():
+        if weight_key not in patched_state_dict:
+            continue
+        scale_inv_key = f"{weight_key}_scale_inv"
+        weight_path = key_to_path.get(weight_key)
+        scale_inv_path = key_to_path.get(scale_inv_key)
+        if weight_path is None or scale_inv_path is None:
+            continue
+        with safe_open(str(weight_path), framework="pt", device="cpu") as f:
+            if weight_key not in f.keys():
+                continue
+            source_weight = f.get_tensor(weight_key)
+        with safe_open(str(scale_inv_path), framework="pt", device="cpu") as f:
+            if scale_inv_key not in f.keys():
+                continue
+            source_scale_inv = f.get_tensor(scale_inv_key)
+        dequantized_weight = _dequantize_fp8_checkpoint_tensor(source_weight, source_scale_inv)
+        if dequantized_weight is None:
+            warnings.warn(
+                f"Could not dequantize FP8 source tensor for {weight_key}: "
+                f"{tuple(source_weight.shape)} / {tuple(source_scale_inv.shape)}.",
+                stacklevel=2,
+            )
+            continue
+        block_size = 16
+        weight_scale = weight_scale.to(dequantized_weight.device)
+        weight_scale_2 = weight_scale_2.to(dequantized_weight.device)
+        patched_state_dict[weight_key] = to_quantized_weight(
+            dequantized_weight,
+            weight_scale,
+            QUANTIZATION_NVFP4,
+            weight_scale_2,
+            block_size,
+        )
+        patched_state_dict[f"{weight_key}_scale"] = weight_scale.cpu()
+        patched_state_dict[f"{weight_key}_scale_2"] = weight_scale_2.cpu()
+        patched += 1
+
+    if patched:
+        print(f"Repacked FP8 shared experts for NVFP4 export: {patched} tensors.")
+    return patched_state_dict
+
+
 def _restore_excluded_source_tensors_from_checkpoint(
     state_dict: dict[str, Any],
     quant_config: dict[str, Any],
@@ -588,7 +744,11 @@ def requantize_resmooth_fused_llm_layers(model: torch.nn.Module):
 
 
 def _export_quantized_weight(
-    sub_module: nn.Module, dtype: torch.dtype, weight_name: str = "weight"
+    sub_module: nn.Module,
+    dtype: torch.dtype,
+    weight_name: str = "weight",
+    source_key_to_path: dict[str, Path] | None = None,
+    module_name: str | None = None,
 ):
     """For the given weight attr of the sub_module, export the quantization info of it.
 
@@ -624,6 +784,72 @@ def _export_quantized_weight(
     output_quantizer: TensorQuantizer | SequentialQuantizer | None = getattr(
         sub_module, quantizer_attrs.output_quantizer, None
     )
+
+    def _load_source_tensor(key: str) -> torch.Tensor | None:
+        if source_key_to_path is None:
+            return None
+        shard_path = source_key_to_path.get(key)
+        if shard_path is None:
+            return None
+        with safe_open(str(shard_path), framework="pt", device="cpu") as f:
+            if key not in f.keys():
+                return None
+            return f.get_tensor(key)
+
+    def _dequantize_with_scale_inv(
+        fp8_weight: torch.Tensor, scale_inv: torch.Tensor, device: torch.device
+    ) -> torch.Tensor | None:
+        if fp8_weight.dim() != 2 or scale_inv.dim() != 2:
+            warnings.warn(
+                f"Skipping FP8 source dequantization for {type(sub_module).__name__}.{weight_name}: "
+                f"unsupported weight/scale_inv shapes {tuple(fp8_weight.shape)} / "
+                f"{tuple(scale_inv.shape)}.",
+                stacklevel=2,
+            )
+            return None
+        block_out = (fp8_weight.shape[0] + scale_inv.shape[0] - 1) // scale_inv.shape[0]
+        block_in = (fp8_weight.shape[1] + scale_inv.shape[1] - 1) // scale_inv.shape[1]
+        scale = scale_inv.to(device=device, dtype=torch.float32)
+        scale = scale.repeat_interleave(int(block_out), dim=0)[: fp8_weight.shape[0], :]
+        scale = scale.repeat_interleave(int(block_in), dim=1)[:, : fp8_weight.shape[1]]
+        return fp8_weight.to(device=device, dtype=torch.float32) * scale
+
+    def _dequantize_fp8_source_weight(weight: torch.Tensor) -> torch.Tensor:
+        if quantization_format not in [
+            QUANTIZATION_NVFP4,
+            QUANTIZATION_NVFP4_AWQ,
+            QUANTIZATION_NVFP4_SVDQUANT,
+        ]:
+            return weight
+
+        if module_name is not None:
+            source_weight = _load_source_tensor(f"{module_name}.{weight_name}")
+            source_scale_inv = _load_source_tensor(f"{module_name}.{weight_name}_scale_inv")
+            if (
+                source_weight is not None
+                and source_scale_inv is not None
+                and source_weight.element_size() <= 1
+            ):
+                dequantized = _dequantize_with_scale_inv(
+                    source_weight, source_scale_inv, weight.device
+                )
+                if dequantized is not None:
+                    return dequantized
+
+        scale_inv = getattr(sub_module, f"{weight_name}_scale_inv", None)
+        if scale_inv is None or not torch.is_tensor(scale_inv) or weight.element_size() > 1:
+            return weight
+        dequantized = _dequantize_with_scale_inv(weight, scale_inv, weight.device)
+        return weight if dequantized is None else dequantized
+
+    dequantized_weight = _dequantize_fp8_source_weight(weight)
+    if dequantized_weight is not weight:
+        weight = nn.Parameter(dequantized_weight.contiguous(), requires_grad=False)
+        setattr(sub_module, weight_name, weight)
+        scale_inv_name = f"{weight_name}_scale_inv"
+        for attr_map in (sub_module._parameters, sub_module._buffers, sub_module._modules):
+            attr_map.pop(scale_inv_name, None)
+        sub_module.__dict__.pop(scale_inv_name, None)
 
     if quantization_format == QUANTIZATION_FP8:
         # Convert amax to float32
@@ -797,6 +1023,7 @@ def _process_quantized_modules(
     model: nn.Module,
     dtype: torch.dtype,
     is_modelopt_qlora: bool = False,
+    source_key_to_path: dict[str, Path] | None = None,
 ) -> None:
     """Process all quantized modules in model, export weights in-place.
 
@@ -811,8 +1038,23 @@ def _process_quantized_modules(
             If True, modules with base_layer attribute are skipped.
     """
     fsdp_module_to_reshard = None
+    fused_expert_modules: list[tuple[str, nn.Module]] = []
+
+    def _has_enabled_fused_expert_weight_quantizer(module: nn.Module) -> bool:
+        for attr in ("gate_up_proj_weight_quantizers", "down_proj_weight_quantizers"):
+            quantizers = getattr(module, attr, None)
+            if quantizers is None:
+                continue
+            if any(getattr(quantizer, "is_enabled", False) for quantizer in quantizers):
+                return True
+        return False
 
     for name, sub_module in model.named_modules():
+        if hasattr(sub_module, "gate_up_proj_weight_quantizers"):
+            if _has_enabled_fused_expert_weight_quantizer(sub_module):
+                fused_expert_modules.append((name, sub_module))
+            continue
+
         # Optimization to perform resharding only once per decoder layer to avoid extra communication overhead
         if isinstance(sub_module, FSDPModule):
             # Every time we encounter a new FSDPModule, the previous decoder layer is fully processed.
@@ -838,7 +1080,12 @@ def _process_quantized_modules(
             if is_quantlinear(sub_module):
                 try:
                     with fsdp2_aware_weight_update(model, sub_module, reshard=False):
-                        _export_quantized_weight(sub_module, dtype)
+                        _export_quantized_weight(
+                            sub_module,
+                            dtype,
+                            source_key_to_path=source_key_to_path,
+                            module_name=name,
+                        )
                 except AssertionError as e:
                     raise AssertionError(
                         f"Failed to export module '{name}' (type={type(sub_module).__name__}): {e}"
@@ -861,14 +1108,24 @@ def _process_quantized_modules(
                 # Export the quantized weights
                 with fsdp2_aware_weight_update(model, sub_module, reshard=False):
                     for weight_name in ["gate_up_proj", "down_proj"]:
-                        _export_quantized_weight(sub_module, dtype, weight_name)
-            elif hasattr(sub_module, "gate_up_proj_weight_quantizers"):
-                # Generic fused MoE experts (_QuantFusedExperts) with per-expert
-                # quantizer ModuleLists. Split into per-expert modules and export.
-                from modelopt.torch.export.moe_utils import _export_fused_experts
+                        _export_quantized_weight(
+                            sub_module,
+                            dtype,
+                            weight_name,
+                            source_key_to_path=source_key_to_path,
+                            module_name=name,
+                        )
 
-                with fsdp2_aware_weight_update(model, sub_module, reshard=False):
-                    _export_fused_experts(sub_module, dtype)
+    if fused_expert_modules:
+        # Generic fused MoE experts (_QuantFusedExperts) expose quantizers through
+        # per-expert ModuleLists, so the container itself may not report a standard
+        # quantization format. Process them explicitly after named_modules()
+        # iteration to avoid mutating the module tree while traversing it.
+        from modelopt.torch.export.moe_utils import _export_fused_experts
+
+        for _name, sub_module in fused_expert_modules:
+            with fsdp2_aware_weight_update(model, sub_module, reshard=False):
+                _export_fused_experts(sub_module, dtype)
 
 
 def _export_transformers_checkpoint(
@@ -1005,8 +1262,26 @@ def _export_transformers_checkpoint(
             f"Syncing the shared NVFP4 global_amax/amax for serving-engine fusion."
         )
 
+    shared_expert_nvfp4_export_scales = _collect_fp8_shared_expert_nvfp4_export_scales(model)
+    source_key_to_path = (
+        _load_safetensors_key_to_path(source_checkpoint_path)
+        if source_checkpoint_path is not None
+        else None
+    )
+    attached_fp8_scale_inv = _attach_fp8_source_scale_inv_buffers(model, source_checkpoint_path)
+    if attached_fp8_scale_inv:
+        print(
+            "Attached FP8 source scale_inv tensors for NVFP4 export: "
+            f"{attached_fp8_scale_inv} tensors."
+        )
+
     # Process all quantized modules and export weights
-    _process_quantized_modules(model, dtype, is_modelopt_qlora)
+    _process_quantized_modules(
+        model,
+        dtype,
+        is_modelopt_qlora,
+        source_key_to_path=source_key_to_path,
+    )
 
     # Reconstruct fused MoELinear: per-expert _QuantLinear weights → original 3D format
     from modelopt.torch.quantization.plugins.huggingface import _reconstruct_fused_moe_linear
@@ -1030,6 +1305,11 @@ def _export_transformers_checkpoint(
     )
     quantized_state_dict = _drop_excluded_dense_compressed_residue(
         quantized_state_dict, quant_config
+    )
+    quantized_state_dict = _requantize_fp8_shared_expert_nvfp4_weights(
+        quantized_state_dict,
+        source_checkpoint_path,
+        shared_expert_nvfp4_export_scales,
     )
 
     return quantized_state_dict, quant_config

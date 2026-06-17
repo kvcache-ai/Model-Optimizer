@@ -15,6 +15,7 @@
 
 """Calibration utilities."""
 
+import fnmatch
 import hashlib
 import json
 import math
@@ -1115,6 +1116,8 @@ def local_hessian_calibrate(
     resume_keep_checkpoint: bool = False,
     resume_extend_calib: bool = False,
     resume_stop_stage: str | None = None,
+    weight_search_include: str | None = None,
+    fp8_source_checkpoint_path: str | None = None,
 ):
     """Calibrate the model using local Hessian-weighted MSE search.
 
@@ -1202,6 +1205,75 @@ def local_hessian_calibrate(
         return
 
     name_to_module = dict(model.named_modules())
+
+    def _split_glob_patterns(patterns: str | None) -> list[str]:
+        if patterns is None:
+            return []
+        return [pattern.strip() for pattern in patterns.split(",") if pattern.strip()]
+
+    weight_search_include_patterns = _split_glob_patterns(weight_search_include)
+
+    def _matches_any_pattern(name: str, patterns: list[str]) -> bool:
+        return any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns)
+
+    def _load_safetensors_weight_map(checkpoint_path: str | None) -> dict[str, Path]:
+        if checkpoint_path is None:
+            return {}
+        root = Path(checkpoint_path)
+        if not root.exists():
+            warnings.warn(f"local_hessian fp8 source checkpoint does not exist: {root}")
+            return {}
+        index_path = root / "model.safetensors.index.json"
+        if index_path.exists():
+            with index_path.open("r", encoding="utf-8") as f:
+                index = json.load(f)
+            weight_map = index.get("weight_map", {})
+            return {key: root / shard for key, shard in weight_map.items()}
+        shard_paths = sorted(root.glob("*.safetensors"))
+        if len(shard_paths) == 1:
+            from safetensors import safe_open
+
+            with safe_open(shard_paths[0], framework="pt", device="cpu") as sf:
+                return {key: shard_paths[0] for key in sf.keys()}
+        if checkpoint_path is not None:
+            warnings.warn(f"Could not find a safetensors index in fp8 source checkpoint: {root}")
+        return {}
+
+    fp8_source_weight_map = _load_safetensors_weight_map(fp8_source_checkpoint_path)
+
+    def _load_fp8_source_tensor(key: str) -> torch.Tensor | None:
+        shard_path = fp8_source_weight_map.get(key)
+        if shard_path is None:
+            return None
+        from safetensors import safe_open
+
+        with safe_open(shard_path, framework="pt", device="cpu") as sf:
+            if key not in sf.keys():
+                return None
+            return sf.get_tensor(key)
+
+    def _dequantize_fp8_linear_weight(weight: torch.Tensor, scale_inv: torch.Tensor | None) -> torch.Tensor:
+        if scale_inv is None or weight.element_size() > 1:
+            return weight
+        scale = scale_inv.to(device=weight.device, dtype=torch.float32)
+        block_m = math.ceil(weight.shape[0] / max(scale.shape[0], 1))
+        block_n = math.ceil(weight.shape[1] / max(scale.shape[1], 1))
+        scale = scale.repeat_interleave(block_m, dim=0)[: weight.shape[0], :]
+        scale = scale.repeat_interleave(block_n, dim=1)[:, : weight.shape[1]]
+        return weight.to(torch.float32) * scale
+
+    def _get_fp8_source_weight_for_local_hessian_search(
+        name: str, module: nn.Module
+    ) -> torch.Tensor | None:
+        source_weight = _load_fp8_source_tensor(name + ".weight")
+        if source_weight is None:
+            return None
+        source_scale_inv = _load_fp8_source_tensor(name + ".weight_scale_inv")
+        device = _infer_weight_device(module)
+        return _dequantize_fp8_linear_weight(
+            source_weight.to(device=device),
+            source_scale_inv.to(device=device) if source_scale_inv is not None else None,
+        )
 
     def _get_module_tensor_attr(module: nn.Module, attr_name: str) -> torch.Tensor | None:
         attr = module._parameters.get(attr_name)
@@ -1868,6 +1940,10 @@ def local_hessian_calibrate(
         skip_weight_quantizer_ids: set[int] = set()
         for info in weight_hessian_infos:
             name = info["name"]
+            if weight_search_include_patterns and not _matches_any_pattern(
+                str(name), weight_search_include_patterns
+            ):
+                continue
             weight_quantizer = info["weight_quantizer"]
             helper = info["helper"]
 
@@ -1939,12 +2015,24 @@ def local_hessian_calibrate(
                 )
 
         # Process weights ONE AT A TIME with immediate amax computation and cleanup
-        weight_list = [
+        unfiltered_weight_list = [
             info
             for info in weight_hessian_infos
             if id(info["weight_quantizer"]) not in skip_weight_quantizer_ids
             and info["weight_quantizer"]._calibrator is not None
         ]
+        weight_list = [
+            info
+            for info in unfiltered_weight_list
+            if not weight_search_include_patterns
+            or _matches_any_pattern(str(info["name"]), weight_search_include_patterns)
+        ]
+        if weight_search_include_patterns:
+            print_rank_0(
+                "local_hessian: restricting weight search to "
+                f"{len(weight_list)}/{len(unfiltered_weight_list)} weight(s) matching "
+                f"{weight_search_include_patterns}."
+            )
         weight_keys = [info["name"] for info in weight_list]
         start_idx = 0
         if stage == "weight_loop":
@@ -1980,9 +2068,20 @@ def local_hessian_calibrate(
                     )
                     weight_quantizer(weight)
                 else:
-                    with enable_weight_access_and_writeback(module, model, name_to_module):
-                        weight = module.weight
-                        weight_quantizer(weight)
+                    source_weight = _get_fp8_source_weight_for_local_hessian_search(
+                        str(info["name"]), module
+                    )
+                    if source_weight is not None:
+                        weight_quantizer(source_weight)
+                    else:
+                        with enable_weight_access_and_writeback(module, model, name_to_module):
+                            weight = module.weight
+                            if fp8_source_checkpoint_path is not None:
+                                module_scale_inv = _get_module_tensor_attr(module, "weight_scale_inv")
+                                if module_scale_inv is not None:
+                                    module_scale_inv = module_scale_inv.to(device=weight.device)
+                                weight = _dequantize_fp8_linear_weight(weight, module_scale_inv)
+                            weight_quantizer(weight)
 
                 # Step 2: IMMEDIATELY compute amax before calibration data grows
                 if cal.compute_amax() is not None:

@@ -1521,6 +1521,25 @@ class LocalHessianCalibConfig(QuantizeAlgorithmConfig):
         ),
     )
 
+    weight_search_include: str | None = ModeloptField(
+        default=None,
+        title="Glob patterns limiting local-Hessian weight search.",
+        description=(
+            "Optional comma-separated fnmatch patterns. When set, only matching weights run "
+            "local-Hessian MSE search; all other restored quantizer states are preserved."
+        ),
+    )
+
+    fp8_source_checkpoint_path: str | None = ModeloptField(
+        default=None,
+        title="Source checkpoint for FP8 Linear dequantization during weight search.",
+        description=(
+            "Optional HF safetensors checkpoint. If provided, local-Hessian weight search uses "
+            "<name>.weight and <name>.weight_scale_inv from this checkpoint to dequantize FP8 "
+            "Linear weights before computing NVFP4 scales."
+        ),
+    )
+
 
 class SmoothQuantCalibConfig(QuantizeAlgorithmConfig):
     """The config for ``smoothquant`` algorithm (SmoothQuant).

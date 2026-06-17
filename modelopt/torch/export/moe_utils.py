@@ -70,6 +70,55 @@ def _export_fused_experts(module: nn.Module, dtype: torch.dtype) -> None:
     # 2-3. Split + export each per-expert projection.
     fused_dim0 = gate_up.shape[1]  # 2 * expert_dim
 
+    def _replace_amax_buffer(quantizer: nn.Module, value: torch.Tensor) -> None:
+        value = value.contiguous().clone().detach()
+        if not hasattr(quantizer, "_amax"):
+            quantizer.register_buffer("_amax", value)
+            return
+        value = value.to(device=quantizer._amax.device)
+        if quantizer._amax.shape == value.shape:
+            quantizer.amax = value
+        elif "_amax" in quantizer._buffers:
+            quantizer._buffers["_amax"] = value
+        else:
+            quantizer._amax = value
+
+    def _slice_fused_rows(
+        tensor: torch.Tensor,
+        fused_start: int,
+        split_rows: int,
+        fused_rows: int,
+        label: str,
+    ) -> torch.Tensor | None:
+        rows = tensor.shape[0]
+        if rows == 1 or rows == split_rows:
+            return tensor.contiguous()
+        if rows == fused_rows:
+            return tensor[fused_start : fused_start + split_rows].contiguous()
+        if rows < fused_rows and fused_rows % rows == 0:
+            row_start = fused_start * rows // fused_rows
+            row_end = (fused_start + split_rows) * rows // fused_rows
+        elif rows > fused_rows and rows % fused_rows == 0:
+            rows_per_weight = rows // fused_rows
+            row_start = fused_start * rows_per_weight
+            row_end = (fused_start + split_rows) * rows_per_weight
+        else:
+            warnings.warn(
+                f"{label}: fused tensor dim0 ({rows}) is not compatible with "
+                f"fused_rows ({fused_rows}). Skipping row slicing, which may "
+                f"produce incorrect quantization scales.",
+                stacklevel=2,
+            )
+            return None
+        if row_end <= row_start:
+            warnings.warn(
+                f"{label}: fused tensor row slice is empty ({row_start}:{row_end}). "
+                f"Skipping row slicing, which may produce incorrect quantization scales.",
+                stacklevel=2,
+            )
+            return None
+        return tensor[row_start:row_end].contiguous()
+
     for idx in range(n):
         expert = nn.Module()
 
@@ -91,25 +140,22 @@ def _export_fused_experts(module: nn.Module, dtype: torch.dtype) -> None:
             w_quantizer = copy.deepcopy(w_quantizer_src) if is_gate_up else w_quantizer_src
 
             # For per-channel amax (dim >= 1), proportionally slice dim-0
-            # to match the split weight.
+            # to match the split weight. TensorQuantizer.amax does not allow
+            # shape changes, so replace the buffer when the split changes shape.
             if (
                 hasattr(w_quantizer, "_amax")
                 and w_quantizer._amax is not None
                 and w_quantizer._amax.dim() >= 1
             ):
-                amax = w_quantizer._amax
-                amax_dim0 = amax.shape[0]
-                if fused_total % amax_dim0 == 0:
-                    slice_start = fused_start * amax_dim0 // fused_total
-                    slice_end = (fused_start + weight_slice.shape[0]) * amax_dim0 // fused_total
-                    w_quantizer.amax = amax[slice_start:slice_end].contiguous()
-                else:
-                    warnings.warn(
-                        f"Expert {idx} {proj_name}: fused amax dim0 ({amax_dim0}) does not "
-                        f"evenly divide fused_total ({fused_total}). Skipping amax slicing, "
-                        f"which may produce incorrect quantization scales.",
-                        stacklevel=2,
-                    )
+                amax = _slice_fused_rows(
+                    w_quantizer._amax,
+                    fused_start,
+                    weight_slice.shape[0],
+                    fused_total,
+                    f"Expert {idx} {proj_name} amax",
+                )
+                if amax is not None:
+                    _replace_amax_buffer(w_quantizer, amax)
 
             # If the weight quantizer was never calibrated, compute amax from weights.
             if (
@@ -132,11 +178,15 @@ def _export_fused_experts(module: nn.Module, dtype: torch.dtype) -> None:
             if is_gate_up:
                 expert_scales = gate_up_scales[idx] if isinstance(gate_up_scales, torch.Tensor) else None
                 if expert_scales is not None and expert_scales.dim() >= 1:
-                    scale_rows = expert_scales.shape[0]
-                    if fused_total % scale_rows == 0:
-                        scale_start = fused_start * scale_rows // fused_total
-                        scale_end = (fused_start + weight_slice.shape[0]) * scale_rows // fused_total
-                        expert_scales = expert_scales[scale_start:scale_end].contiguous()
+                    sliced_scales = _slice_fused_rows(
+                        expert_scales,
+                        fused_start,
+                        weight_slice.shape[0],
+                        fused_total,
+                        f"Expert {idx} {proj_name} fp8 scale_inv",
+                    )
+                    if sliced_scales is not None:
+                        expert_scales = sliced_scales
             else:
                 expert_scales = down_scales[idx] if isinstance(down_scales, torch.Tensor) else None
 
@@ -163,6 +213,8 @@ def _export_fused_experts(module: nn.Module, dtype: torch.dtype) -> None:
     for attr in (
         "gate_up_proj",
         "down_proj",
+        "gate_up_proj_scale_inv",
+        "down_proj_scale_inv",
         "gate_up_proj_weight_quantizers",
         "gate_up_proj_input_quantizer",
         "down_proj_weight_quantizers",

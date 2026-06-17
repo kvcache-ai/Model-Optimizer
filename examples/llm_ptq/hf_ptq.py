@@ -269,6 +269,22 @@ def _augment_algorithm_with_resume_cfg(
             cfg["resume_stop_stage"] = args.resume_stop_stage
         else:
             warnings.warn("--resume_stop_stage is only supported for local_hessian; ignoring it.")
+    if getattr(args, "local_hessian_weight_search_include", None) is not None:
+        if cfg.get("method") == "local_hessian":
+            cfg["weight_search_include"] = args.local_hessian_weight_search_include
+        else:
+            warnings.warn(
+                "--local_hessian_weight_search_include is only supported for local_hessian; "
+                "ignoring it."
+            )
+    if getattr(args, "local_hessian_fp8_source_checkpoint_path", None) is not None:
+        if cfg.get("method") == "local_hessian":
+            cfg["fp8_source_checkpoint_path"] = args.local_hessian_fp8_source_checkpoint_path
+        else:
+            warnings.warn(
+                "--local_hessian_fp8_source_checkpoint_path is only supported for local_hessian; "
+                "ignoring it."
+            )
     return cfg
 
 
@@ -1553,6 +1569,22 @@ def parse_args() -> argparse.Namespace:
             "Use this on calibration shards before merging their resume checkpoints."
         ),
     )
+    parser.add_argument(
+        "--local_hessian_weight_search_include",
+        default=None,
+        help=(
+            "For local_hessian repair runs only: comma-separated glob patterns limiting "
+            "which weight names run local-Hessian MSE search."
+        ),
+    )
+    parser.add_argument(
+        "--local_hessian_fp8_source_checkpoint_path",
+        default=None,
+        help=(
+            "For local_hessian FP8-source repair runs: HF safetensors checkpoint used to "
+            "dequantize Linear weights before NVFP4 weight search."
+        ),
+    )
 
     args = parser.parse_args()
     if args.resume_max_save_interval <= 0:
@@ -1565,6 +1597,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--resume_extend_calib requires --resume_checkpoint_dir.")
     if args.resume_stop_stage is not None and args.resume_checkpoint_dir is None:
         parser.error("--resume_stop_stage requires --resume_checkpoint_dir.")
+    if args.local_hessian_weight_search_include is not None and args.resume_checkpoint_dir is None:
+        parser.error("--local_hessian_weight_search_include requires --resume_checkpoint_dir.")
     if args.moe_calib_experts_ratio is not None and not (0.0 < args.moe_calib_experts_ratio <= 1.0):
         parser.error("--moe_calib_experts_ratio must be in the range (0.0, 1.0].")
 
